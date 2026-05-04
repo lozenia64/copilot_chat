@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local Chat</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+    <div class="app-backdrop" aria-hidden="true">
+        <span class="backdrop-orb orb-one"></span>
+        <span class="backdrop-orb orb-two"></span>
+        <span class="backdrop-grid"></span>
+    </div>
+
+    <div class="app-shell">
+        <div id="sidebarOverlay" class="sidebar-overlay"></div>
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header flex-header">
+                <div>
+                    <p class="sidebar-label">Workspace</p>
+                    <h1>Chats</h1>
+                </div>
+                <button id="newChatButton" class="primary-button flex-btn" type="button">
+                    <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                    <span class="btn-text">새 대화</span>
+                </button>
+                <button id="closeMenuButton" class="icon-button mobile-only" aria-label="닫기">
+                    <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                </button>
+            </div>
+            <div id="sessionList" class="session-list" role="list"></div>
+        </aside>
+
+        <main class="main-panel">
+                        <header class="topbar">
+                <div class="topbar-left">
+                    <button id="menuButton" class="icon-button mobile-only" aria-label="메뉴 열기">
+                        <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
+                    </button>
+                    <div>
+                        <p class="topbar-label">Local Chat</p>
+                                    <h2>LiteLLM Copilot Studio</h2>
+                    </div>
+                </div>
+                <div class="topbar-actions">
+                    <button id="authStatusButton" class="ghost-button auth-status-button flex-btn" type="button" aria-label="GitHub Copilot 상태">
+                        <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"></path></svg>
+                                    <span class="btn-text" id="authStatusText">상태 확인 중</span>
+                    </button>
+                    <label class="model-picker">
+                        <span>Model</span>
+                        <select id="modelSelect" aria-label="모델 선택"></select>
+                    </label>
+                </div>
+            </header>
+
+            <section id="usageSummary" class="usage-summary" data-status="unavailable" aria-live="polite">
+                <div class="usage-summary-header">
+                    <div class="usage-summary-copy">
+                        <p class="usage-summary-kicker">Usage summary</p>
+                        <h3 class="usage-summary-title">Copilot usage snapshot</h3>
+                    </div>
+                    <button
+                        id="usageSummaryToggle"
+                        class="ghost-button usage-summary-toggle"
+                        type="button"
+                        aria-controls="usageSummaryPanel"
+                        aria-expanded="true"
+                        hidden
+                    >
+                        접기
+                    </button>
+                </div>
+                <div id="usageSummaryPanel" class="usage-summary-panel">
+                    <div class="usage-summary-grid">
+                        <article class="usage-card">
+                            <span class="usage-label">Chat messages</span>
+                            <strong id="chatMessagesRemaining" class="usage-value">-</strong>
+                            <span id="chatMessagesMeta" class="usage-meta">로그인 필요</span>
+                        </article>
+                        <article class="usage-card">
+                            <span class="usage-label">Premium requests</span>
+                            <strong id="premiumRequestsRemaining" class="usage-value">-</strong>
+                            <span id="premiumRequestsMeta" class="usage-meta">로그인 필요</span>
+                        </article>
+                    </div>
+                    <p id="usageSummaryDetail" class="usage-summary-detail">GitHub 로그인 후 서버가 조회한 usage snapshot을 표시합니다.</p>
+                </div>
+            </section>
+
+            <section id="messages" class="message-list" aria-live="polite"></section>
+
+            <form id="composerForm" class="composer" autocomplete="off">
+                <div class="composer-inner">
+                    <textarea
+                        id="promptInput"
+                        rows="1"
+                        placeholder="메시지를 입력하세요. Shift+Enter로 줄바꿈"
+                        aria-label="메시지 입력"
+                    ></textarea>
+                    <button id="sendButton" class="primary-button send-button flex-btn" type="submit">
+                        <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>
+                        <span id="sendButtonText" class="btn-text">보내기</span>
+                    </button>
+                </div>
+                <div class="composer-meta">
+                    <p id="streamStatus" class="stream-status" data-tone="ready" role="status" aria-live="polite" aria-atomic="true">전송 준비 완료</p>
+                </div>
+            </form>
+        </main>
+    </div>
+
+    <div id="toastContainer" class="toast-container" aria-live="polite" aria-atomic="true"></div>
+
+    <div id="authModal" class="auth-modal hidden" aria-hidden="true">
+        <div class="auth-modal-card" role="dialog" aria-modal="true" aria-labelledby="authModalTitle">
+            <div class="auth-modal-header">
+                <div>
+                    <p class="sidebar-label">GitHub Copilot</p>
+                    <h3 id="authModalTitle">GitHub Copilot 연결</h3>
+                </div>
+                <button id="authModalCloseButton" class="icon-button" type="button" aria-label="닫기">×</button>
+            </div>
+
+            <p id="authModalDescription" class="auth-description"></p>
+            <p id="authStatusMeta" class="auth-meta"></p>
+
+            <section id="authCodeSection" class="auth-code-section hidden">
+                <div>
+                    <span class="auth-section-label">GitHub 코드</span>
+                    <div id="authUserCode" class="auth-code">-</div>
+                </div>
+                <a id="authVerificationLink" class="ghost-button auth-link-button" href="#" target="_blank" rel="noreferrer">
+                    GitHub 열기
+                </a>
+            </section>
+
+            <section id="authConnectedSection" class="auth-connected-section hidden">
+                <div class="auth-detail-row">
+                    <span class="auth-section-label">Credential ID</span>
+                    <strong id="authCredentialId">-</strong>
+                </div>
+                <div class="auth-detail-row">
+                    <span class="auth-section-label">Copilot 토큰 만료</span>
+                    <strong id="authExpiryText">-</strong>
+                </div>
+                <div class="auth-detail-row">
+                    <span class="auth-section-label">Chat messages</span>
+                    <strong id="authChatMessagesRemaining">-</strong>
+                </div>
+                <div class="auth-detail-row">
+                    <span class="auth-section-label">Premium requests</span>
+                    <strong id="authPremiumRequestsRemaining">-</strong>
+                </div>
+                <p id="authUsageDetail" class="auth-usage-detail">Usage snapshot을 불러오는 중입니다.</p>
+            </section>
+
+            <div class="auth-modal-actions">
+                <button id="authSecondaryButton" class="ghost-button secondary-button" type="button">취소</button>
+                <button id="authPrimaryButton" class="primary-button" type="button">로그인 시작</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        window.APP_CONFIG = {
+            defaultModel: "gpt-5.4",
+            credentialStorageKey: "copilotCredentialEnvelope"
+        };
+    </script>
+    <script src="/static/app.js" defer></script>
+</body>
+</html>

@@ -39,7 +39,7 @@ pip install -r requirements.txt
 
 `main.py` loads `.env` from the repository root automatically if the file exists.
 
-The checked-in `.env.example` intentionally keeps normal runtime setup minimal.
+The `.env.example` file intentionally keeps normal runtime setup minimal.
 
 For most setups, `.env` only needs one value:
 

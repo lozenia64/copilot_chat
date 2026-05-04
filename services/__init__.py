@@ -1,0 +1,1 @@
+"""Service layer for Copilot auth and LiteLLM chat orchestration."""
