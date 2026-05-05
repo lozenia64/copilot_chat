@@ -523,6 +523,14 @@ class CopilotAuthService:
         self.apply_session_cookie(response, session_secret)
         return session_secret
 
+    def get_conversation_scope(self, session_secret: str) -> str:
+        digest = hmac.new(
+            self._binding_key,
+            f"copilot-conversation-scope:{session_secret}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
     def inspect_envelope(self, envelope: str | None, session_secret: str) -> dict[str, Any]:
         if not envelope:
             return self._unauthenticated_status_payload()

@@ -6,6 +6,8 @@ const QUICK_PROMPTS = [
     "현재 테스트 파일 기준으로 검증 포인트를 정리해줘.",
 ];
 const SERVER_ERROR_MESSAGES = Object.freeze({
+    conversation_message_required: "보낼 메시지를 입력하세요.",
+    conversation_not_found: "대화 세션을 찾을 수 없습니다. 새 대화를 시작하세요.",
     chat_messages_invalid: "채팅 메시지 형식이 올바르지 않습니다. 다시 시도하세요.",
     chat_model_not_allowed: "선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
     chat_model_required: "채팅 모델을 확인할 수 없습니다. 다시 시도하세요.",
@@ -187,6 +189,127 @@ function persistCredentialEnvelope(envelope) {
     window.localStorage.removeItem(CREDENTIAL_STORAGE_KEY);
 }
 
+function normalizeServerMessage(message) {
+    return {
+        id: typeof message?.id === "string" && message.id ? message.id : createId("message"),
+        role: typeof message?.role === "string" && message.role ? message.role : "assistant",
+        content: typeof message?.content === "string" ? message.content : "",
+        status: typeof message?.status === "string" && message.status ? message.status : "complete",
+        createdAt: Number.isFinite(Number(message?.createdAt)) ? Number(message.createdAt) : Date.now(),
+        updatedAt: Number.isFinite(Number(message?.updatedAt)) ? Number(message.updatedAt) : Date.now(),
+    };
+}
+
+function normalizeServerSession(session) {
+    const messages = Array.isArray(session?.messages)
+        ? session.messages.map(normalizeServerMessage)
+        : [];
+
+    return {
+        id: typeof session?.id === "string" && session.id ? session.id : createId("session"),
+        title: typeof session?.title === "string" && session.title.trim() ? session.title : "새 대화",
+        messages,
+        model: typeof session?.model === "string" && session.model.trim() ? session.model : DEFAULT_MODEL,
+        createdAt: Number.isFinite(Number(session?.createdAt)) ? Number(session.createdAt) : Date.now(),
+        updatedAt: Number.isFinite(Number(session?.updatedAt)) ? Number(session.updatedAt) : Date.now(),
+    };
+}
+
+function replaceSession(sessionPayload) {
+    const nextSession = normalizeServerSession(sessionPayload);
+    const index = state.sessions.findIndex((session) => session.id === nextSession.id);
+    if (index === -1) {
+        state.sessions.unshift(nextSession);
+        return nextSession;
+    }
+
+    state.sessions[index] = nextSession;
+    return state.sessions[index];
+}
+
+function applyConversationStatePayload(payload) {
+    const sessions = Array.isArray(payload?.sessions)
+        ? payload.sessions.map(normalizeServerSession)
+        : [];
+
+    state.sessions = sessions;
+    const requestedActiveSessionId = typeof payload?.activeSessionId === "string"
+        ? payload.activeSessionId
+        : null;
+    state.activeSessionId = sessions.some((session) => session.id === requestedActiveSessionId)
+        ? requestedActiveSessionId
+        : sessions[0]?.id ?? null;
+
+    renderSidebar();
+    renderMessages();
+    populateModelOptions();
+}
+
+async function loadConversationState({ silent = false } = {}) {
+    try {
+        const payload = await requestJson("/api/conversations");
+        applyConversationStatePayload(payload);
+        return state.sessions;
+    } catch (error) {
+        if (!silent) {
+            showToast(error.message || "대화 목록을 불러오지 못했습니다.", "error");
+        }
+
+        renderSidebar();
+        renderMessages();
+        populateModelOptions();
+        return state.sessions;
+    }
+}
+
+async function syncConversationStateSilently() {
+    await loadConversationState({ silent: true });
+}
+
+function clearConversationState() {
+    state.sessions = [];
+    state.activeSessionId = null;
+    renderSidebar();
+    renderMessages();
+    populateModelOptions();
+}
+
+async function persistSessionModel(sessionId, modelId, previousModel) {
+    const session = state.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+        return false;
+    }
+
+    try {
+        const payload = await requestJson(`/api/conversations/${encodeURIComponent(sessionId)}/model`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({ model: modelId }),
+        });
+        replaceSession(payload?.session);
+        renderSidebar();
+        renderMessages();
+        populateModelOptions();
+        return true;
+    } catch (error) {
+        session.model = previousModel;
+        syncModelSelect();
+        showToast(error.message || "대화 모델을 저장하지 못했습니다.", "error");
+        return false;
+    }
+}
+
+async function ensureConversationSession() {
+    const existingSession = getActiveSession();
+    if (existingSession) {
+        return existingSession;
+    }
+
+    return createSession({ focus: false, silent: true });
+}
+
 function getActiveSession() {
     return state.sessions.find((session) => session.id === state.activeSessionId) ?? null;
 }
@@ -243,26 +366,53 @@ function promoteSession(sessionId) {
     state.sessions.unshift(session);
 }
 
-function createSession() {
+async function createSession({ focus = true, silent = false } = {}) {
     const currentSession = getActiveSession();
-    const session = {
-        id: createId("session"),
-        title: "새 대화",
-        messages: [],
-        model: resolveModelId(currentSession?.model || elements.modelSelect.value || DEFAULT_MODEL),
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-    };
 
-    state.sessions.unshift(session);
-    state.activeSessionId = session.id;
-    renderSidebar();
-    renderMessages();
-    focusInput();
-    return session;
+    try {
+        const payload = await requestJson("/api/conversations", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                model: resolveModelId(currentSession?.model || elements.modelSelect.value || DEFAULT_MODEL),
+            }),
+        });
+        const session = replaceSession(payload?.session);
+        state.activeSessionId = typeof payload?.activeSessionId === "string"
+            ? payload.activeSessionId
+            : session.id;
+        renderSidebar();
+        renderMessages();
+        populateModelOptions();
+        if (focus) {
+            focusInput();
+        }
+        return session;
+    } catch (error) {
+        if (!silent) {
+            showToast(error.message || "새 대화를 만들지 못했습니다.", "error");
+        }
+        return null;
+    }
 }
 
-function selectSession(sessionId) {
+async function selectSession(sessionId) {
+    const session = state.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+        return;
+    }
+
+    try {
+        await requestJson(`/api/conversations/${encodeURIComponent(sessionId)}/activate`, {
+            method: "POST",
+        });
+    } catch (error) {
+        showToast(error.message || "대화를 열지 못했습니다.", "error");
+        return;
+    }
+
     state.activeSessionId = sessionId;
     renderSidebar();
     renderMessages();
@@ -299,7 +449,9 @@ function renderSidebar() {
         preview.textContent = lastMessage ? truncateText(lastMessage.content.replace(/\s+/g, " "), 60) : "대화를 시작해 보세요.";
 
         button.append(abbreviation, title, preview);
-        button.addEventListener("click", () => selectSession(session.id));
+        button.addEventListener("click", () => {
+            void selectSession(session.id);
+        });
         fragment.appendChild(button);
     });
 
@@ -1618,6 +1770,8 @@ async function disconnectCopilot() {
         state.copilot.copilotTokenExpiresAt = 0;
         state.copilot.needsRefresh = false;
         resetUsageSnapshot();
+        clearConversationState();
+        await loadConversationState({ silent: true });
         closeAuthModal();
         showToast("GitHub Copilot 연결을 해제했습니다.", "info");
     } catch (error) {
@@ -1665,11 +1819,17 @@ async function sendPrompt() {
         return;
     }
 
-    const session = getActiveSession() ?? createSession();
+    const session = await ensureConversationSession();
+    if (!session) {
+        focusInput();
+        return;
+    }
+
     const userMessage = {
         id: createId("message"),
         role: "user",
         content,
+        status: "complete",
     };
 
     session.messages.push(userMessage);
@@ -1677,15 +1837,11 @@ async function sendPrompt() {
     updateSessionTitle(session);
     promoteSession(session.id);
 
-    const requestMessages = session.messages.map((message) => ({
-        role: message.role,
-        content: message.content,
-    }));
-
     const assistantMessage = {
         id: createId("message"),
         role: "assistant",
         content: "",
+        status: "streaming",
     };
 
     session.messages.push(assistantMessage);
@@ -1701,17 +1857,19 @@ async function sendPrompt() {
     updateComposerControls();
     syncComposerStatus();
     let shouldRefreshUsage = false;
+    let shouldResyncConversation = false;
+    let didPersistTurn = false;
     const searchMode = resolveSearchModeForPrompt(content);
 
     try {
-        const response = await fetch("/api/chat", {
+        const response = await fetch(`/api/conversations/${encodeURIComponent(session.id)}/messages`, {
             method: "POST",
             headers: {
                 "Content-Type": "application/json",
             },
             body: JSON.stringify({
+                content,
                 model: session.model || DEFAULT_MODEL,
-                messages: requestMessages,
                 credentialEnvelope: state.copilot.envelope,
                 ...(searchMode ? { searchMode } : {}),
             }),
@@ -1732,18 +1890,27 @@ async function sendPrompt() {
             throw new Error(error.message);
         }
 
+        didPersistTurn = true;
+
         if (!response.body) {
             throw new Error("스트리밍 응답을 받을 수 없습니다.");
         }
 
         await consumeChatStream(response.body, session, assistantMessage);
+        shouldResyncConversation = didPersistTurn;
         shouldRefreshUsage = true;
     } catch (error) {
         if (state.abortController?.signal.aborted) {
+            shouldResyncConversation = true;
             setComposerStatus(COMPOSER_ABORTED_MESSAGE, "stopped", { persistMs: COMPOSER_STATUS_HOLD_MS });
             showToast("응답 생성을 중단했습니다.", "info");
         } else {
-            if (!assistantMessage.content) {
+            shouldResyncConversation = true;
+            if (!didPersistTurn) {
+                session.messages = session.messages.filter(
+                    (message) => message.id !== userMessage.id && message.id !== assistantMessage.id,
+                );
+            } else if (!assistantMessage.content) {
                 session.messages = session.messages.filter((message) => message.id !== assistantMessage.id);
             }
             if (state.copilot.status !== "connected") {
@@ -1763,8 +1930,12 @@ async function sendPrompt() {
         state.abortController = null;
         state.isStreaming = false;
         updateComposerControls();
-    syncComposerStatus();
+        syncComposerStatus();
         focusInput();
+
+        if (shouldResyncConversation) {
+            await syncConversationStateSilently();
+        }
 
         if (shouldRefreshUsage && state.copilot.envelope && state.copilot.status === "connected") {
             await refreshCopilotStatus({ preserveVisualState: true, silent: true });
@@ -1837,20 +2008,19 @@ function bindEvents() {
     if (elements.sidebarOverlay) elements.sidebarOverlay.addEventListener("click", closeSidebar);
 
     elements.newChatButton.addEventListener("click", () => {
-        createSession();
-        renderSidebar();
-        renderMessages();
-        populateModelOptions();
+        void createSession();
     });
 
-    elements.modelSelect.addEventListener("change", (event) => {
+    elements.modelSelect.addEventListener("change", async (event) => {
         const session = getActiveSession();
         if (!session) {
             return;
         }
 
+        const previousModel = session.model;
         session.model = resolveModelId(event.target.value);
         syncModelSelect();
+        await persistSessionModel(session.id, session.model, previousModel);
     });
 
     elements.composerForm.addEventListener("submit", handleComposerSubmit);
@@ -1906,15 +2076,22 @@ function bindEvents() {
 
 async function init() {
     bindEvents();
-    createSession();
     adjustTextareaHeight();
     updateComposerControls();
     syncComposerStatus();
     syncResponsiveLayout();
     populateModelOptions();
     renderAuthState();
+    await loadConversationState({ silent: true });
     await refreshCopilotStatus();
     await loadModels();
+    state.sessions.forEach((session) => {
+        session.model = resolveModelId(session.model);
+    });
+    populateModelOptions();
+    if (state.sessions.length === 0) {
+        await createSession({ focus: false, silent: true });
+    }
 }
 
 init();

@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from services.copilot_auth import CopilotAuthService, CopilotCredentialSession, CopilotLoginTicket
 from services.copilot_chat import CopilotChatRequestError, CopilotChatService
+from services.conversation_service import ConversationService
 from services.web_search import WebSearchResult
 
 
@@ -1000,6 +1001,162 @@ class ChatLoggingContractTests(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class ConversationPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.env_patcher = patch.dict(
+            os.environ,
+            {
+                "COPILOT_CHAT_HISTORY_DB_PATH": str(
+                    Path(self.temp_dir.name) / "chat-history-state.sqlite3"
+                ),
+            },
+            clear=False,
+        )
+        self.env_patcher.start()
+        self.service = ConversationService()
+        self.scope_token = "history-scope-token"
+        self.session = self.service.create_conversation(self.scope_token, "gpt-5.4")
+
+    async def asyncTearDown(self) -> None:
+        self.env_patcher.stop()
+        self.temp_dir.cleanup()
+
+    async def test_persist_stream_marks_partial_when_error_follows_visible_text(self) -> None:
+        turn = self.service.begin_turn(
+            self.scope_token,
+            self.session["id"],
+            content="partial reply please",
+            model=None,
+        )
+
+        class FakeRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        async def fake_stream():
+            yield b'data: {"choices": [{"delta": {"content": "hel"}}]}\n\n'
+            yield 'data: {"code": "copilot_chat_stream_failed", "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}\n\n'.encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        chunks = [
+            chunk
+            async for chunk in self.service.persist_stream(
+                request=FakeRequest(),
+                scope_id=self.scope_token,
+                conversation_id=self.session["id"],
+                assistant_message_id=turn.assistant_message_id,
+                stream=fake_stream(),
+            )
+        ]
+
+        payload = b"".join(chunks).decode("utf-8")
+        self.assertIn('data: {"choices": [{"delta": {"content": "hel"}}]}', payload)
+        self.assertIn('data: {"code": "copilot_chat_stream_failed", "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}', payload)
+
+        state = self.service.get_state_payload(self.scope_token)
+        restored_session = next(session for session in state["sessions"] if session["id"] == self.session["id"])
+        self.assertEqual([message["role"] for message in restored_session["messages"]], ["user", "assistant"])
+        self.assertEqual(restored_session["messages"][1]["content"], "hel")
+        self.assertEqual(restored_session["messages"][1]["status"], "partial")
+
+    async def test_persist_stream_keeps_reasoning_content_that_the_ui_shows(self) -> None:
+        turn = self.service.begin_turn(
+            self.scope_token,
+            self.session["id"],
+            content="show your reasoning",
+            model=None,
+        )
+
+        class FakeRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        async def fake_stream():
+            yield b'data: {"choices": [{"delta": {"reasoning_content": "step 1"}}]}\n\n'
+            yield b'data: {"choices": [{"delta": {"content": " final"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        _ = [
+            chunk
+            async for chunk in self.service.persist_stream(
+                request=FakeRequest(),
+                scope_id=self.scope_token,
+                conversation_id=self.session["id"],
+                assistant_message_id=turn.assistant_message_id,
+                stream=fake_stream(),
+            )
+        ]
+
+        state = self.service.get_state_payload(self.scope_token)
+        restored_session = next(session for session in state["sessions"] if session["id"] == self.session["id"])
+        self.assertEqual(restored_session["messages"][1]["content"], "step 1 final")
+        self.assertEqual(restored_session["messages"][1]["status"], "complete")
+
+    async def test_persist_stream_marks_aborted_reply_and_keeps_visible_partial_text(self) -> None:
+        turn = self.service.begin_turn(
+            self.scope_token,
+            self.session["id"],
+            content="abort reply please",
+            model=None,
+        )
+
+        class FakeRequest:
+            async def is_disconnected(self) -> bool:
+                return True
+
+        async def fake_stream():
+            yield b'data: {"choices": [{"delta": {"content": "stop here"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        _ = [
+            chunk
+            async for chunk in self.service.persist_stream(
+                request=FakeRequest(),
+                scope_id=self.scope_token,
+                conversation_id=self.session["id"],
+                assistant_message_id=turn.assistant_message_id,
+                stream=fake_stream(),
+            )
+        ]
+
+        state = self.service.get_state_payload(self.scope_token)
+        restored_session = next(session for session in state["sessions"] if session["id"] == self.session["id"])
+        self.assertEqual(restored_session["messages"][1]["content"], "stop here")
+        self.assertEqual(restored_session["messages"][1]["status"], "aborted")
+
+    async def test_persist_stream_drops_empty_assistant_message_when_no_visible_text_is_saved(self) -> None:
+        turn = self.service.begin_turn(
+            self.scope_token,
+            self.session["id"],
+            content="empty reply please",
+            model=None,
+        )
+
+        class FakeRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        async def fake_stream():
+            yield 'data: {"code": "copilot_chat_stream_failed", "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}\n\n'.encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        _ = [
+            chunk
+            async for chunk in self.service.persist_stream(
+                request=FakeRequest(),
+                scope_id=self.scope_token,
+                conversation_id=self.session["id"],
+                assistant_message_id=turn.assistant_message_id,
+                stream=fake_stream(),
+            )
+        ]
+
+        state = self.service.get_state_payload(self.scope_token)
+        restored_session = next(session for session in state["sessions"] if session["id"] == self.session["id"])
+        self.assertEqual([message["role"] for message in restored_session["messages"]], ["user"])
+
+
 class ChatSearchModeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.service = CopilotChatService(
@@ -1088,6 +1245,9 @@ class CopilotApiTests(unittest.TestCase):
                 "COPILOT_PENDING_LOGIN_DB_PATH": str(
                     Path(self.temp_dir.name) / "pending-login-state.sqlite3"
                 ),
+                "COPILOT_CHAT_HISTORY_DB_PATH": str(
+                    Path(self.temp_dir.name) / "chat-history-state.sqlite3"
+                ),
             },
             clear=False,
         )
@@ -1120,6 +1280,23 @@ class CopilotApiTests(unittest.TestCase):
     ) -> str:
         session = make_credential_session(expires_at=expires_at, credential_id=credential_id)
         return self.main.auth_service._encrypt_session(session, session_secret)
+
+    def _create_conversation(self, model: str = "gpt-5.4") -> dict[str, object]:
+        response = self.client.post(
+            "/api/conversations",
+            json={"model": model},
+        )
+        self.assertEqual(response.status_code, 200)
+        return response.json()
+
+    def test_conversations_route_issues_auth_session_cookie_only(self) -> None:
+        response = self.client.get("/api/conversations")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"sessions": [], "activeSessionId": None})
+        set_cookie_header = response.headers.get("set-cookie", "")
+        self.assertIn(self.main.auth_service.session_cookie_name, set_cookie_header)
+        self.assertNotIn("copilot_history_scope", set_cookie_header)
 
     def test_status_without_envelope_returns_unauthenticated_state(self) -> None:
         response = self.client.post(
@@ -1377,6 +1554,15 @@ class CopilotApiTests(unittest.TestCase):
         cases = [
             ("/api/copilot/status", []),
             ("/api/copilot/login/poll", {}),
+            ("/api/conversations", []),
+            ("/api/conversations/conv-test/model", []),
+            (
+                "/api/conversations/conv-test/messages",
+                {
+                    "model": "gpt-5.4",
+                    "credentialEnvelope": "opaque-value",
+                },
+            ),
             (
                 "/api/chat",
                 {
@@ -1586,6 +1772,308 @@ class CopilotApiTests(unittest.TestCase):
         self.assertFalse(payload["authenticated"])
         self.assertTrue(payload["shouldClearEnvelope"])
         self.assertEqual(payload["code"], "copilot_credential_binding_mismatch")
+
+    def test_logout_clears_conversation_restore_for_current_browser(self) -> None:
+        self._establish_browser_session()
+        created = self._create_conversation()
+
+        before_logout = self.client.get("/api/conversations")
+        self.assertEqual(before_logout.status_code, 200)
+        self.assertEqual(len(before_logout.json()["sessions"]), 1)
+        self.assertEqual(before_logout.json()["sessions"][0]["id"], created["session"]["id"])
+
+        old_cookie_value = self.client.cookies.get(self.main.auth_service.session_cookie_name)
+        logout_response = self.client.post("/api/copilot/logout")
+        new_cookie_value = self.client.cookies.get(self.main.auth_service.session_cookie_name)
+
+        self.assertEqual(logout_response.status_code, 200)
+        self.assertNotEqual(old_cookie_value, new_cookie_value)
+
+        after_logout = self.client.get("/api/conversations")
+        self.assertEqual(after_logout.status_code, 200)
+        self.assertEqual(after_logout.json(), {"sessions": [], "activeSessionId": None})
+
+    def test_chat_history_uses_separate_sqlite_file_from_pending_login_state(self) -> None:
+        self.assertNotEqual(
+            self.main.auth_service.pending_login_db_path,
+            self.main.conversation_service.history_db_path,
+        )
+        self.assertTrue(self.main.auth_service.pending_login_db_path.exists())
+        self.assertTrue(self.main.conversation_service.history_db_path.exists())
+
+    def test_conversation_model_update_rejects_disallowed_model(self) -> None:
+        self._establish_browser_session()
+        conversation_payload = self._create_conversation()
+
+        response = self.client.post(
+            f"/api/conversations/{conversation_payload['session']['id']}/model",
+            json={"model": "not-allowed-model"},
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "chat_model_not_allowed")
+
+    def test_conversation_model_update_returns_404_for_unknown_conversation(self) -> None:
+        self._establish_browser_session()
+
+        response = self.client.post(
+            "/api/conversations/conv-missing/model",
+            json={"model": "gpt-5.4"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "conversation_not_found")
+
+    def test_conversation_activate_returns_404_for_unknown_conversation(self) -> None:
+        self._establish_browser_session()
+
+        response = self.client.post("/api/conversations/conv-missing/activate")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "conversation_not_found")
+
+    def test_conversation_message_requires_visible_content(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        conversation_payload = self._create_conversation()
+
+        response = self.client.post(
+            f"/api/conversations/{conversation_payload['session']['id']}/messages",
+            json={
+                "content": "   ",
+                "model": "gpt-5.4",
+                "credentialEnvelope": envelope,
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json()["code"], "conversation_message_required")
+
+    def test_conversation_message_returns_404_for_unknown_conversation(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+
+        response = self.client.post(
+            "/api/conversations/conv-missing/messages",
+            json={
+                "content": "hello",
+                "model": "gpt-5.4",
+                "credentialEnvelope": envelope,
+            },
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["code"], "conversation_not_found")
+
+    def test_conversation_message_persists_visible_transcript_only(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        conversation_payload = self._create_conversation()
+        conversation_id = conversation_payload["session"]["id"]
+        prepared_messages = [
+            {
+                "role": "system",
+                "content": "A server-provided web search reference message may appear next.",
+            },
+            {
+                "role": "assistant",
+                "content": 'Reference only: untrusted web search data gathered by the server. {"type":"web_search_results"}',
+            },
+            {
+                "role": "user",
+                "content": "서울 날씨를 검색해보고 알려줘",
+            },
+        ]
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            yield b'data: {"choices":[{"delta":{"content":"search-backed answer"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        with patch.object(
+            self.main.chat_service,
+            "prepare_messages_for_completion",
+            AsyncMock(return_value=prepared_messages),
+        ) as prepare_messages:
+            with patch.object(
+                self.main.chat_service,
+                "stream_chat_completion",
+                fake_stream_chat_completion,
+            ):
+                response = self.client.post(
+                    f"/api/conversations/{conversation_id}/messages",
+                    json={
+                        "content": "서울 날씨를 검색해보고 알려줘",
+                        "model": "gpt-5.4",
+                        "credentialEnvelope": envelope,
+                        "searchMode": "auto",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        prepare_messages.assert_awaited_once_with(
+            [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}],
+            search_mode="auto",
+        )
+
+        history_response = self.client.get("/api/conversations")
+        self.assertEqual(history_response.status_code, 200)
+        session_payload = next(
+            session
+            for session in history_response.json()["sessions"]
+            if session["id"] == conversation_id
+        )
+        self.assertEqual([message["role"] for message in session_payload["messages"]], ["user", "assistant"])
+        self.assertEqual(session_payload["messages"][0]["content"], "서울 날씨를 검색해보고 알려줘")
+        self.assertEqual(session_payload["messages"][1]["content"], "search-backed answer")
+
+    def test_conversations_restore_sessions_active_session_messages_and_model_after_refresh(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        first_conversation = self._create_conversation()
+        second_conversation = self._create_conversation()
+        first_conversation_id = first_conversation["session"]["id"]
+        second_conversation_id = second_conversation["session"]["id"]
+
+        activate_response = self.client.post(f"/api/conversations/{first_conversation_id}/activate")
+        self.assertEqual(activate_response.status_code, 200)
+        self.assertEqual(activate_response.json()["activeSessionId"], first_conversation_id)
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            yield b'data: {"choices":[{"delta":{"content":"restored answer"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        with patch.object(
+            self.main.chat_service,
+            "stream_chat_completion",
+            fake_stream_chat_completion,
+        ):
+            send_response = self.client.post(
+                f"/api/conversations/{first_conversation_id}/messages",
+                json={
+                    "content": "refresh-safe question",
+                    "model": "gpt-5.4",
+                    "credentialEnvelope": envelope,
+                },
+            )
+
+        self.assertEqual(send_response.status_code, 200)
+        session_cookie = self.client.cookies.get(self.main.auth_service.session_cookie_name)
+        self.assertIsNotNone(session_cookie)
+
+        reloaded_main = importlib.reload(self.main)
+        with TestClient(reloaded_main.app) as refreshed_client:
+            refreshed_client.cookies.set(
+                reloaded_main.auth_service.session_cookie_name,
+                session_cookie,
+            )
+            restored_response = refreshed_client.get("/api/conversations")
+
+        self.assertEqual(restored_response.status_code, 200)
+        restored_payload = restored_response.json()
+        self.assertEqual(restored_payload["activeSessionId"], first_conversation_id)
+        self.assertEqual(len(restored_payload["sessions"]), 2)
+        restored_first_conversation = next(
+            session
+            for session in restored_payload["sessions"]
+            if session["id"] == first_conversation_id
+        )
+        restored_second_conversation = next(
+            session
+            for session in restored_payload["sessions"]
+            if session["id"] == second_conversation_id
+        )
+        self.assertEqual(restored_first_conversation["model"], "gpt-5.4")
+        self.assertEqual(
+            [message["content"] for message in restored_first_conversation["messages"]],
+            ["refresh-safe question", "restored answer"],
+        )
+        self.assertEqual(restored_second_conversation["messages"], [])
+
+    def test_conversation_message_returns_refreshed_envelope_header_when_session_is_refreshed(self) -> None:
+        session_secret = self._establish_browser_session()
+        stale_envelope = self._issue_envelope(session_secret, expires_at=time.time() - 1)
+        refreshed_session = make_credential_session(
+            copilot_api_token="refreshed-conversation-token",
+            expires_at=time.time() + 3600,
+            credential_id="cred-conversation-refreshed",
+        )
+        conversation_payload = self._create_conversation()
+        streamed_session: dict[str, object] = {}
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            streamed_session["session"] = session
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        with patch.object(
+            self.main.auth_service,
+            "_build_credential_session",
+            AsyncMock(return_value=refreshed_session),
+        ):
+            with patch.object(
+                self.main.chat_service,
+                "stream_chat_completion",
+                fake_stream_chat_completion,
+            ):
+                response = self.client.post(
+                    f"/api/conversations/{conversation_payload['session']['id']}/messages",
+                    json={
+                        "content": "hello",
+                        "model": "gpt-5.4",
+                        "credentialEnvelope": stale_envelope,
+                    },
+                )
+
+        refreshed_envelope = response.headers.get("X-Copilot-Credential-Envelope")
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNotNone(refreshed_envelope)
+        self.assertNotEqual(refreshed_envelope, stale_envelope)
+        self.assertEqual(
+            streamed_session["session"].copilot_api_token,
+            "refreshed-conversation-token",
+        )
+
+        refreshed_status = self.client.post(
+            "/api/copilot/status",
+            json={"credentialEnvelope": refreshed_envelope},
+        )
+        self.assertTrue(refreshed_status.json()["authenticated"])
+        self.assertEqual(refreshed_status.json()["credentialId"], "cred-conversation-refreshed")
+
+    def test_conversation_message_sse_error_contract_matches_raw_chat(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        conversation_payload = self._create_conversation()
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+            yield (
+                'data: {"code": "copilot_chat_stream_failed", "message": '
+                '"채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}\n\n'
+            ).encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        with patch.object(
+            self.main.chat_service,
+            "stream_chat_completion",
+            fake_stream_chat_completion,
+        ):
+            response = self.client.post(
+                f"/api/conversations/{conversation_payload['session']['id']}/messages",
+                json={
+                    "content": "hello",
+                    "model": "gpt-5.4",
+                    "credentialEnvelope": envelope,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('data: {"choices":[{"delta":{"content":"hello"}}]}', response.text)
+        self.assertIn(
+            'data: {"code": "copilot_chat_stream_failed", "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}',
+            response.text,
+        )
+        self.assertTrue(response.text.endswith("data: [DONE]\n\n"))
 
     def test_chat_returns_refreshed_envelope_header_when_session_is_refreshed(self) -> None:
         session_secret = self._establish_browser_session()

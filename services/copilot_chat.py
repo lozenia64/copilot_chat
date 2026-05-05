@@ -65,11 +65,7 @@ class CopilotChatService:
     def get_models_payload(self) -> dict[str, list[dict[str, str]]]:
         return {"data": [{"id": model_id} for model_id in self.model_ids]}
 
-    def validate_chat_request(
-        self,
-        model: str | None,
-        messages: list[dict[str, Any]],
-    ) -> tuple[str, list[dict[str, Any]]]:
+    def resolve_model(self, model: str | None) -> str:
         model_id = (model or self.default_model).strip()
         if not model_id:
             raise CopilotChatRequestError(
@@ -81,6 +77,14 @@ class CopilotChatService:
                 code="chat_model_not_allowed",
                 message="선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
             )
+        return model_id
+
+    def validate_chat_request(
+        self,
+        model: str | None,
+        messages: list[dict[str, Any]],
+    ) -> tuple[str, list[dict[str, Any]]]:
+        model_id = self.resolve_model(model)
         if not isinstance(messages, list) or not messages:
             raise CopilotChatRequestError(
                 code="chat_messages_invalid",

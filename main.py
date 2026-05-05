@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 from dotenv import load_dotenv
@@ -13,6 +14,7 @@ from pydantic import BaseModel
 
 from services.copilot_auth import CopilotAuthError, CopilotAuthService
 from services.copilot_chat import CopilotChatRequestError, CopilotChatService
+from services.conversation_service import ConversationService, ConversationStateError
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,6 +31,14 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 auth_service = CopilotAuthService()
 chat_service = CopilotChatService(config_path=CONFIG_PATH, default_model=DEFAULT_MODEL)
+conversation_service = ConversationService()
+
+
+@dataclass(slots=True)
+class BrowserSessionContext:
+    session_secret: str
+    conversation_scope_id: str
+    created_session_cookie: bool
 
 
 def _build_index_html() -> str:
@@ -63,8 +73,65 @@ class ChatRequest(BaseModel):
     searchMode: str | None = None
 
 
+class ConversationCreateRequest(BaseModel):
+    model: str | None = None
+
+
+class ConversationModelRequest(BaseModel):
+    model: str | None = None
+
+
+class ConversationMessageRequest(BaseModel):
+    content: str
+    model: str | None = None
+    credentialEnvelope: str | None = None
+    searchMode: str | None = None
+
+
+def _resolve_browser_session_context(request: Request) -> BrowserSessionContext:
+    session_secret, created = auth_service.get_or_create_session_secret(request)
+    return BrowserSessionContext(
+        session_secret=session_secret,
+        conversation_scope_id=auth_service.get_conversation_scope(session_secret),
+        created_session_cookie=created,
+    )
+
+
+def _apply_browser_session_cookie(response: Response, browser_session: BrowserSessionContext) -> None:
+    if browser_session.created_session_cookie:
+        auth_service.apply_session_cookie(response, browser_session.session_secret)
+
+
+def _build_streaming_response(stream) -> StreamingResponse:
+    return StreamingResponse(
+        stream,
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.exception_handler(CopilotAuthError)
 async def handle_copilot_auth_error(_: Request, exc: CopilotAuthError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.message, "code": exc.code},
+    )
+
+
+@app.exception_handler(CopilotChatRequestError)
+async def handle_copilot_chat_request_error(_: Request, exc: CopilotChatRequestError) -> JSONResponse:
+    return JSONResponse(
+        status_code=400,
+        content={"message": exc.message, "code": exc.code},
+    )
+
+
+@app.exception_handler(ConversationStateError)
+async def handle_conversation_state_error(_: Request, exc: ConversationStateError) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
         content={"message": exc.message, "code": exc.code},
@@ -98,24 +165,132 @@ async def get_models() -> dict[str, list[dict[str, str]]]:
     return chat_service.get_models_payload()
 
 
+@app.get("/api/conversations")
+async def get_conversations(request: Request, response: Response) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    _apply_browser_session_cookie(response, browser_session)
+    return conversation_service.get_state_payload(browser_session.conversation_scope_id)
+
+
+@app.post("/api/conversations")
+async def create_conversation(
+    request: Request,
+    response: Response,
+    payload: ConversationCreateRequest,
+) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    model_id = chat_service.resolve_model(payload.model)
+    session = conversation_service.create_conversation(browser_session.conversation_scope_id, model_id)
+    _apply_browser_session_cookie(response, browser_session)
+    return {
+        "session": session,
+        "activeSessionId": session["id"],
+    }
+
+
+@app.post("/api/conversations/{conversation_id}/activate")
+async def activate_conversation(
+    conversation_id: str,
+    request: Request,
+    response: Response,
+) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    conversation_service.activate_conversation(browser_session.conversation_scope_id, conversation_id)
+    _apply_browser_session_cookie(response, browser_session)
+    return {"activeSessionId": conversation_id}
+
+
+@app.post("/api/conversations/{conversation_id}/model")
+async def update_conversation_model(
+    conversation_id: str,
+    request: Request,
+    response: Response,
+    payload: ConversationModelRequest,
+) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    model_id = chat_service.resolve_model(payload.model)
+    session = conversation_service.update_conversation_model(
+        browser_session.conversation_scope_id,
+        conversation_id,
+        model_id,
+    )
+    _apply_browser_session_cookie(response, browser_session)
+    return {"session": session}
+
+
+@app.post("/api/conversations/{conversation_id}/messages")
+async def send_conversation_message(
+    conversation_id: str,
+    request: Request,
+    payload: ConversationMessageRequest,
+):
+    if not payload.credentialEnvelope:
+        raise CopilotAuthError(
+            status_code=401,
+            message="이 브라우저의 GitHub Copilot 자격 정보가 없습니다. 먼저 로그인하세요.",
+            code="copilot_login_required",
+        )
+
+    content = conversation_service.validate_message_content(payload.content)
+    model_id = chat_service.resolve_model(payload.model) if payload.model is not None else None
+    search_mode = chat_service.normalize_search_mode(payload.searchMode)
+
+    browser_session = _resolve_browser_session_context(request)
+    copilot_session, refreshed_envelope = await auth_service.resolve_session(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
+    )
+    turn = conversation_service.begin_turn(
+        browser_session.conversation_scope_id,
+        conversation_id,
+        content=content,
+        model=model_id,
+    )
+    prepared_messages = await chat_service.prepare_messages_for_completion(
+        turn.visible_messages,
+        search_mode=search_mode,
+    )
+
+    stream_response = _build_streaming_response(
+        conversation_service.persist_stream(
+            request=request,
+            scope_id=browser_session.conversation_scope_id,
+            conversation_id=conversation_id,
+            assistant_message_id=turn.assistant_message_id,
+            stream=chat_service.stream_chat_completion(
+                request=request,
+                model=turn.model,
+                messages=prepared_messages,
+                session=copilot_session,
+                initiator_messages=turn.visible_messages,
+            ),
+        )
+    )
+    _apply_browser_session_cookie(stream_response, browser_session)
+    if refreshed_envelope:
+        stream_response.headers["X-Copilot-Credential-Envelope"] = refreshed_envelope
+    return stream_response
+
+
 @app.post("/api/copilot/status")
 async def get_copilot_status(
     request: Request,
     response: Response,
     payload: CopilotEnvelopeRequest,
 ) -> dict[str, Any]:
-    session_secret, created = auth_service.get_or_create_session_secret(request)
-    if created:
-        auth_service.apply_session_cookie(response, session_secret)
-    return await auth_service.get_status_payload(payload.credentialEnvelope, session_secret)
+    browser_session = _resolve_browser_session_context(request)
+    _apply_browser_session_cookie(response, browser_session)
+    return await auth_service.get_status_payload(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
+    )
 
 
 @app.post("/api/copilot/login/start")
 async def start_copilot_login(request: Request, response: Response) -> dict[str, Any]:
-    session_secret, created = auth_service.get_or_create_session_secret(request)
-    if created:
-        auth_service.apply_session_cookie(response, session_secret)
-    return await auth_service.start_login(session_secret)
+    browser_session = _resolve_browser_session_context(request)
+    _apply_browser_session_cookie(response, browser_session)
+    return await auth_service.start_login(browser_session.session_secret)
 
 
 @app.post("/api/copilot/login/poll")
@@ -124,10 +299,9 @@ async def poll_copilot_login(
     response: Response,
     payload: CopilotLoginPollRequest,
 ) -> dict[str, Any]:
-    session_secret, created = auth_service.get_or_create_session_secret(request)
-    if created:
-        auth_service.apply_session_cookie(response, session_secret)
-    return await auth_service.poll_login(payload.loginId, session_secret)
+    browser_session = _resolve_browser_session_context(request)
+    _apply_browser_session_cookie(response, browser_session)
+    return await auth_service.poll_login(payload.loginId, browser_session.session_secret)
 
 
 @app.post("/api/copilot/logout")
@@ -145,42 +319,29 @@ async def chat(request: Request, payload: ChatRequest):
             code="copilot_login_required",
         )
 
-    try:
-        model, messages = chat_service.validate_chat_request(payload.model, payload.messages)
-        search_mode = chat_service.normalize_search_mode(payload.searchMode)
-    except CopilotChatRequestError as exc:
-        return JSONResponse(
-            status_code=400,
-            content={"message": exc.message, "code": exc.code},
-        )
+    model, messages = chat_service.validate_chat_request(payload.model, payload.messages)
+    search_mode = chat_service.normalize_search_mode(payload.searchMode)
 
-    session_secret, created = auth_service.get_or_create_session_secret(request)
+    browser_session = _resolve_browser_session_context(request)
     copilot_session, refreshed_envelope = await auth_service.resolve_session(
         payload.credentialEnvelope,
-        session_secret,
+        browser_session.session_secret,
     )
     prepared_messages = await chat_service.prepare_messages_for_completion(
         messages,
         search_mode=search_mode,
     )
 
-    stream_response = StreamingResponse(
+    stream_response = _build_streaming_response(
         chat_service.stream_chat_completion(
             request=request,
             model=model,
             messages=prepared_messages,
             session=copilot_session,
             initiator_messages=messages,
-        ),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
+        )
     )
-    if created:
-        auth_service.apply_session_cookie(stream_response, session_secret)
+    _apply_browser_session_cookie(stream_response, browser_session)
     if refreshed_envelope:
         stream_response.headers["X-Copilot-Credential-Envelope"] = refreshed_envelope
     return stream_response
