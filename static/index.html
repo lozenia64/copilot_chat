@@ -16,80 +16,107 @@
         <span class="backdrop-grid"></span>
     </div>
 
-    <div class="app-shell">
+    <div id="appShell" class="app-shell">
         <div id="sidebarOverlay" class="sidebar-overlay"></div>
         <aside class="sidebar" id="sidebar">
             <div class="sidebar-header flex-header">
-                <div>
+                <div class="sidebar-header-copy">
                     <p class="sidebar-label">Workspace</p>
                     <h1>Chats</h1>
                 </div>
-                <button id="newChatButton" class="primary-button flex-btn" type="button">
-                    <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-                    <span class="btn-text">새 대화</span>
-                </button>
-                <button id="closeMenuButton" class="icon-button mobile-only" aria-label="닫기">
-                    <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
-                </button>
+                <div class="sidebar-header-actions">
+                    <button id="toggleSidebarButton" class="icon-button sidebar-toggle-button desktop-only" type="button" aria-label="사이드바 접기" title="사이드바 접기">
+                        <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M15 6l-6 6 6 6"></path><path d="M20 4v16"></path></svg>
+                    </button>
+                    <button id="newChatButton" class="primary-button flex-btn" type="button">
+                        <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
+                        <span class="btn-text">새 대화</span>
+                    </button>
+                    <button id="closeMenuButton" class="icon-button mobile-only" aria-label="닫기">
+                        <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
+                    </button>
+                </div>
             </div>
             <div id="sessionList" class="session-list" role="list"></div>
         </aside>
 
         <main class="main-panel">
-                        <header class="topbar">
+            <header class="topbar">
                 <div class="topbar-left">
                     <button id="menuButton" class="icon-button mobile-only" aria-label="메뉴 열기">
                         <svg viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
                     </button>
-                    <div>
+                    <div class="topbar-brand" aria-label="LiteLLM Copilot Studio">
+                        <span class="brand-mark" aria-hidden="true">
+                            <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M5 7.5A2.5 2.5 0 0 1 7.5 5h9A2.5 2.5 0 0 1 19 7.5v6A2.5 2.5 0 0 1 16.5 16H10l-4 3v-3A2.5 2.5 0 0 1 5 13.5z"></path></svg>
+                        </span>
+                        <div class="topbar-copy">
                         <p class="topbar-label">Local Chat</p>
-                                    <h2>LiteLLM Copilot Studio</h2>
+                            <h2>Copilot Studio</h2>
+                        </div>
                     </div>
                 </div>
                 <div class="topbar-actions">
-                    <button id="authStatusButton" class="ghost-button auth-status-button flex-btn" type="button" aria-label="GitHub Copilot 상태">
+                    <button id="authStatusButton" class="ghost-button auth-status-button topbar-tool" type="button" aria-label="GitHub Copilot 상태" title="GitHub Copilot 상태">
                         <svg class="btn-icon" viewBox="0 0 24 24" width="20" height="20" stroke="currentColor" stroke-width="2" fill="none"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm0 15c-2.76 0-5-2.24-5-5s2.24-5 5-5 5 2.24 5 5-2.24 5-5 5z"></path></svg>
-                                    <span class="btn-text" id="authStatusText">상태 확인 중</span>
+                        <span class="status-dot" aria-hidden="true"></span>
+                        <span class="visually-hidden" id="authStatusText">상태 확인 중</span>
                     </button>
-                    <label class="model-picker">
-                        <span>Model</span>
+                    <label class="model-picker topbar-tool" title="모델 선택">
+                        <svg class="model-picker-icon" viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="3"></rect><path d="M8 9h8"></path><path d="M8 13h5"></path></svg>
+                        <span class="visually-hidden">모델 선택</span>
                         <select id="modelSelect" aria-label="모델 선택"></select>
+                        <svg class="model-picker-chevron" viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
                     </label>
                 </div>
             </header>
 
             <section id="usageSummary" class="usage-summary" data-status="unavailable" aria-live="polite">
-                <div class="usage-summary-header">
-                    <div class="usage-summary-copy">
-                        <p class="usage-summary-kicker">Usage summary</p>
-                        <h3 class="usage-summary-title">Copilot usage snapshot</h3>
+                <div class="usage-summary-copy">
+                    <span class="usage-summary-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" width="18" height="18" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v18"></path><path d="M7 8.5A5 5 0 0 1 17 8.5c0 5-5 4-5 8"></path></svg>
+                    </span>
+                    <div class="usage-summary-copy-text">
+                        <p class="usage-summary-kicker">Usage</p>
+                        <h3 class="usage-summary-title">Copilot snapshot</h3>
                     </div>
-                    <button
-                        id="usageSummaryToggle"
-                        class="ghost-button usage-summary-toggle"
-                        type="button"
-                        aria-controls="usageSummaryPanel"
-                        aria-expanded="true"
-                        hidden
-                    >
-                        접기
-                    </button>
                 </div>
                 <div id="usageSummaryPanel" class="usage-summary-panel">
                     <div class="usage-summary-grid">
-                        <article class="usage-card">
+                        <article id="chatMessagesCard" class="usage-card">
                             <span class="usage-label">Chat messages</span>
-                            <strong id="chatMessagesRemaining" class="usage-value">-</strong>
+                            <strong id="chatMessagesRemaining" class="usage-value">대기</strong>
+                            <div class="usage-chart" aria-hidden="true">
+                                <span id="chatMessagesChartFill" class="usage-chart-fill"></span>
+                            </div>
                             <span id="chatMessagesMeta" class="usage-meta">로그인 필요</span>
                         </article>
-                        <article class="usage-card">
+                        <article id="premiumRequestsCard" class="usage-card">
                             <span class="usage-label">Premium requests</span>
-                            <strong id="premiumRequestsRemaining" class="usage-value">-</strong>
+                            <strong id="premiumRequestsRemaining" class="usage-value">대기</strong>
+                            <div class="usage-chart" aria-hidden="true">
+                                <span id="premiumRequestsChartFill" class="usage-chart-fill"></span>
+                            </div>
                             <span id="premiumRequestsMeta" class="usage-meta">로그인 필요</span>
                         </article>
                     </div>
                     <p id="usageSummaryDetail" class="usage-summary-detail">GitHub 로그인 후 서버가 조회한 usage snapshot을 표시합니다.</p>
                 </div>
+                <button
+                    id="usageSummaryToggle"
+                    class="ghost-button usage-summary-toggle"
+                    type="button"
+                    aria-controls="usageSummaryPanel"
+                    aria-expanded="true"
+                    aria-label="usage summary 접기"
+                    title="usage summary 접기"
+                    hidden
+                >
+                    <span class="usage-toggle-icon" aria-hidden="true">
+                        <svg class="usage-toggle-symbol usage-toggle-symbol-plus" viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14"></path><path d="M5 12h14"></path></svg>
+                        <svg class="usage-toggle-symbol usage-toggle-symbol-minus" viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" stroke-width="2.2" fill="none" stroke-linecap="round" aria-hidden="true"><path d="M5 12h14"></path></svg>
+                    </span>
+                </button>
             </section>
 
             <section id="messages" class="message-list" aria-live="polite"></section>

@@ -1125,30 +1125,34 @@ class CopilotAuthService:
             "detail": self._usage_detail(reason) if detail is None else detail,
             "source": source,
             "fetchedAt": time.time(),
-            "chatMessages": {"remaining": None, "status": "missing"},
-            "premiumRequests": {"remaining": None, "status": "missing"},
+            "chatMessages": self._empty_usage_metric(),
+            "premiumRequests": self._empty_usage_metric(),
+        }
+
+    def _empty_usage_metric(self) -> dict[str, Any]:
+        return {
+            "remaining": None,
+            "used": None,
+            "total": None,
+            "plan": None,
+            "status": "missing",
         }
 
     def _normalize_usage_snapshot(self, payload: dict[str, Any], *, source: str | None) -> dict[str, Any]:
-        chat_remaining = self._extract_usage_remaining(
+        chat_payload = self._build_usage_metric_payload(
             payload,
             aliases=(("chat", "messages"), ("chat",)),
         )
-        premium_remaining = self._extract_usage_remaining(
+        premium_payload = self._build_usage_metric_payload(
             payload,
             aliases=(("premium", "requests"), ("premium", "interactions"), ("premium",)),
         )
+        premium_payload = self._normalize_premium_requests_metric(
+            premium_payload,
+            source=source,
+        )
 
-        chat_payload = {
-            "remaining": chat_remaining,
-            "status": "available" if chat_remaining is not None else "missing",
-        }
-        premium_payload = {
-            "remaining": premium_remaining,
-            "status": "available" if premium_remaining is not None else "missing",
-        }
-
-        if chat_remaining is None and premium_remaining is None:
+        if chat_payload["status"] == "missing" and premium_payload["status"] == "missing":
             return self._usage_snapshot_unavailable(
                 reason="copilot_usage_shape_unrecognized",
                 source=source,
@@ -1157,7 +1161,7 @@ class CopilotAuthService:
         detail = None
         status = "ok"
         reason = "copilot_usage_ok"
-        if chat_remaining is None or premium_remaining is None:
+        if chat_payload["status"] == "missing" or premium_payload["status"] == "missing":
             status = "partial"
             reason = "copilot_usage_partial"
             detail = self._usage_detail(reason)
@@ -1172,6 +1176,89 @@ class CopilotAuthService:
             "premiumRequests": premium_payload,
         }
 
+    def _build_usage_metric_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        aliases: tuple[tuple[str, ...], ...],
+    ) -> dict[str, Any]:
+        remaining = self._extract_usage_value(
+            payload,
+            aliases=aliases,
+            preferred_tokens={"remaining", "left", "available", "balance"},
+            disallowed_tokens={"used", "spent", "consumed", "total", "limit", "maximum", "max", "plan", "tier", "subscription"},
+        )
+        used = self._extract_usage_value(
+            payload,
+            aliases=aliases,
+            preferred_tokens={"used", "spent", "consumed"},
+            disallowed_tokens={"remaining", "left", "available", "balance", "total", "limit", "maximum", "max", "plan", "tier", "subscription"},
+        )
+        total = self._extract_usage_value(
+            payload,
+            aliases=aliases,
+            preferred_tokens={"total", "limit", "maximum", "max", "included", "quota", "allowance"},
+            disallowed_tokens={"remaining", "left", "available", "balance", "used", "spent", "consumed", "plan", "tier", "subscription"},
+        )
+        plan = self._extract_usage_text(
+            payload,
+            aliases=aliases,
+            preferred_tokens={"plan", "tier", "subscription", "product"},
+            disallowed_tokens={"remaining", "left", "available", "balance", "used", "spent", "consumed", "total", "limit", "maximum", "max", "reset", "renewal", "expiry", "expires", "timestamp", "date"},
+        )
+        remaining = self._normalize_usage_basis_value(remaining)
+        used = self._normalize_usage_basis_value(used)
+        total = self._normalize_usage_total_value(total)
+        has_quota_basis = remaining is not None or used is not None or total is not None
+        return {
+            "remaining": remaining,
+            "used": used,
+            "total": total,
+            "plan": plan,
+            "status": "available" if has_quota_basis else "missing",
+        }
+
+    def _normalize_premium_requests_metric(
+        self,
+        metric: dict[str, Any],
+        *,
+        source: str | None,
+    ) -> dict[str, Any]:
+        remaining = metric.get("remaining")
+        used = metric.get("used")
+        total = metric.get("total")
+        if isinstance(total, int) and total <= 0:
+            total = None
+            metric = {
+                **metric,
+                "total": None,
+            }
+        if not isinstance(remaining, int) or used is not None or total is not None:
+            return metric
+
+        if remaining < 0 or remaining > 100:
+            return metric
+
+        return {
+            **metric,
+            "used": 100 - remaining,
+            "total": 100,
+        }
+
+    def _normalize_usage_basis_value(self, value: int | None) -> int | None:
+        if not isinstance(value, int):
+            return None
+        if value < 0:
+            return None
+        return value
+
+    def _normalize_usage_total_value(self, value: int | None) -> int | None:
+        if not isinstance(value, int):
+            return None
+        if value <= 0:
+            return None
+        return value
+
     def _usage_detail(self, reason: str) -> str | None:
         return USAGE_DETAIL_MESSAGES.get(reason)
 
@@ -1185,21 +1272,55 @@ class CopilotAuthService:
             return "copilot_user_api"
         return "copilot_usage_other"
 
-    def _extract_usage_remaining(
+    def _extract_usage_value(
         self,
         payload: dict[str, Any],
         *,
         aliases: tuple[tuple[str, ...], ...],
+        preferred_tokens: set[str],
+        disallowed_tokens: set[str],
     ) -> int | None:
         best_score = 0
         best_value: int | None = None
 
         for path, numeric_value in self._iter_numeric_paths(payload):
-            score = self._score_usage_path(path, aliases=aliases)
+            score = self._score_usage_path(
+                path,
+                aliases=aliases,
+                preferred_tokens=preferred_tokens,
+                disallowed_tokens=disallowed_tokens,
+            )
             if score <= best_score:
                 continue
             best_score = score
             best_value = numeric_value
+
+        if best_score < 12:
+            return None
+        return best_value
+
+    def _extract_usage_text(
+        self,
+        payload: dict[str, Any],
+        *,
+        aliases: tuple[tuple[str, ...], ...],
+        preferred_tokens: set[str],
+        disallowed_tokens: set[str],
+    ) -> str | None:
+        best_score = 0
+        best_value: str | None = None
+
+        for path, text_value in self._iter_text_paths(payload):
+            score = self._score_usage_path(
+                path,
+                aliases=aliases,
+                preferred_tokens=preferred_tokens,
+                disallowed_tokens=disallowed_tokens,
+            )
+            if score <= best_score:
+                continue
+            best_score = score
+            best_value = text_value
 
         if best_score < 12:
             return None
@@ -1224,11 +1345,32 @@ class CopilotAuthService:
         if coerced is not None:
             yield path, coerced
 
+    def _iter_text_paths(
+        self,
+        value: Any,
+        path: tuple[str, ...] = (),
+    ) -> Iterator[tuple[tuple[str, ...], str]]:
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                yield from self._iter_text_paths(nested_value, path + (str(key),))
+            return
+
+        if isinstance(value, list):
+            for index, nested_value in enumerate(value):
+                yield from self._iter_text_paths(nested_value, path + (str(index),))
+            return
+
+        coerced = self._coerce_usage_text(value)
+        if coerced is not None:
+            yield path, coerced
+
     def _score_usage_path(
         self,
         path: tuple[str, ...],
         *,
         aliases: tuple[tuple[str, ...], ...],
+        preferred_tokens: set[str],
+        disallowed_tokens: set[str],
     ) -> int:
         tokens = self._usage_path_tokens(path)
         token_set = set(tokens)
@@ -1239,13 +1381,13 @@ class CopilotAuthService:
         if any(all(alias in token_set for alias in alias_group) for alias_group in aliases):
             score += 8
 
-        if any(token in token_set for token in {"remaining", "left", "available", "balance"}):
+        if any(token in token_set for token in preferred_tokens):
             score += 6
 
         if any(token in token_set for token in {"usage", "quota", "quotas", "snapshot", "allowance"}):
             score += 2
 
-        if any(token in token_set for token in {"percent", "percentage", "ratio", "used", "spent", "consumed", "reset", "renewal", "limit", "total", "maximum", "max"}):
+        if any(token in token_set for token in disallowed_tokens):
             score -= 8
 
         return score
@@ -1275,6 +1417,20 @@ class CopilotAuthService:
             if not text or not re.fullmatch(r"\d+(?:\.0+)?", text):
                 return None
             return int(float(text))
+        return None
+
+    def _coerce_usage_text(self, value: Any) -> str | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            if value < 0:
+                return None
+            return str(int(value)) if value.is_integer() else str(value)
+        if isinstance(value, str):
+            text = value.strip()
+            return text or None
         return None
 
     def _safe_json_payload(self, response: httpx.Response) -> dict[str, Any] | None:

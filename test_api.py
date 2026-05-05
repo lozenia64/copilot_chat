@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import tempfile
 import time
 import unittest
@@ -12,7 +13,25 @@ import httpx
 from fastapi.testclient import TestClient
 
 from services.copilot_auth import CopilotAuthService, CopilotCredentialSession, CopilotLoginTicket
-from services.copilot_chat import CopilotChatService
+from services.copilot_chat import CopilotChatRequestError, CopilotChatService
+from services.web_search import WebSearchResult
+
+
+FRONTEND_EXPLICIT_SEARCH_PATTERNS = (
+    re.compile(r"^.+?(?:를|을)?\s*(?:웹\s*)?검색(?:\s*$|해|해서|해보|해봐|해보고|해\s*줘|해주세요|해주|해\s*줄래).*$"),
+    re.compile(r"^(?:please\s+)?web\s+search(?:\s+for)?\s+.+$", re.IGNORECASE),
+    re.compile(r"^(?:please\s+)?search\s+for\s+.+$", re.IGNORECASE),
+    re.compile(r"^(?:please\s+)?look\s+up\s+.+$", re.IGNORECASE),
+    re.compile(r"^(?:please\s+)?find\s+(?:online|on\s+the\s+web)\s+.+$", re.IGNORECASE),
+)
+
+
+def resolve_frontend_search_mode_for_prompt(content: str) -> str | None:
+    normalized = content.strip()
+    if not normalized:
+        return None
+
+    return "auto" if any(pattern.match(normalized) for pattern in FRONTEND_EXPLICIT_SEARCH_PATTERNS) else None
 
 
 def make_credential_session(
@@ -39,6 +58,9 @@ def make_usage_snapshot(
     status: str = "ok",
     chat_remaining: int | None = 42,
     premium_remaining: int | None = 7,
+    premium_total: int | None = None,
+    premium_used: int | None = None,
+    premium_plan: str | None = None,
     detail: str | None = None,
     reason: str | None = None,
     source: str | None = "copilot_usage_api",
@@ -51,13 +73,39 @@ def make_usage_snapshot(
         "fetchedAt": time.time(),
         "chatMessages": {
             "remaining": chat_remaining,
+            "used": None,
+            "total": None,
+            "plan": None,
             "status": "available" if chat_remaining is not None else "missing",
         },
         "premiumRequests": {
             "remaining": premium_remaining,
-            "status": "available" if premium_remaining is not None else "missing",
+            "used": premium_used,
+            "total": premium_total,
+            "plan": premium_plan,
+            "status": "available" if any(value is not None for value in (premium_remaining, premium_total, premium_used)) else "missing",
         },
     }
+
+
+class FakeCompletionStream:
+    def __init__(self, chunks: list[object]) -> None:
+        self._chunks = chunks
+        self._index = 0
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self._index >= len(self._chunks):
+            raise StopAsyncIteration
+        chunk = self._chunks[self._index]
+        self._index += 1
+        return chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
 
 
 class DeviceFlowEncodingTests(unittest.IsolatedAsyncioTestCase):
@@ -378,7 +426,7 @@ class DeviceFlowEncodingTests(unittest.IsolatedAsyncioTestCase):
                     json={
                         "usage": {
                             "remaining_chat_messages": 18,
-                            "premium_requests_remaining": 3,
+                            "premium_requests_remaining": 85,
                         }
                     },
                     request=httpx.Request("GET", url),
@@ -389,7 +437,160 @@ class DeviceFlowEncodingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["chatMessages"]["remaining"], 18)
+        self.assertEqual(snapshot["premiumRequests"]["remaining"], 85)
+        self.assertEqual(snapshot["premiumRequests"]["used"], 15)
+        self.assertEqual(snapshot["premiumRequests"]["total"], 100)
+        self.assertEqual(snapshot["premiumRequests"]["plan"], None)
+        self.assertEqual(snapshot["source"], "copilot_user_api")
+
+    async def test_fetch_usage_snapshot_normalizes_remaining_only_premium_quota_fields_from_usage_api(self) -> None:
+        service = self.service
+        service.github_usage_urls = ("https://api.github.com/copilot_internal/v2/usage",)
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            async def get(self, url, headers=None):
+                return httpx.Response(
+                    200,
+                    json={
+                        "usage": {
+                            "remaining_chat_messages": 18,
+                            "premium_requests_remaining": 85,
+                        }
+                    },
+                    request=httpx.Request("GET", url),
+                )
+
+        with patch("services.copilot_auth.httpx.AsyncClient", FakeAsyncClient):
+            snapshot = await service.fetch_usage_snapshot("github-access-token")
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["chatMessages"]["remaining"], 18)
+        self.assertEqual(snapshot["premiumRequests"]["remaining"], 85)
+        self.assertEqual(snapshot["premiumRequests"]["used"], 15)
+        self.assertEqual(snapshot["premiumRequests"]["total"], 100)
+        self.assertEqual(snapshot["premiumRequests"]["plan"], None)
+        self.assertEqual(snapshot["source"], "copilot_usage_api")
+
+    async def test_fetch_usage_snapshot_normalizes_remaining_only_premium_quota_fields_from_generic_source(self) -> None:
+        service = self.service
+        service.github_usage_urls = ("https://example.com/internal/copilot/runtime-usage",)
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            async def get(self, url, headers=None):
+                return httpx.Response(
+                    200,
+                    json={
+                        "usage": {
+                            "remaining_chat_messages": 18,
+                            "premium_requests_remaining": 85,
+                        }
+                    },
+                    request=httpx.Request("GET", url),
+                )
+
+        with patch("services.copilot_auth.httpx.AsyncClient", FakeAsyncClient):
+            snapshot = await service.fetch_usage_snapshot("github-access-token")
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["chatMessages"]["remaining"], 18)
+        self.assertEqual(snapshot["premiumRequests"]["remaining"], 85)
+        self.assertEqual(snapshot["premiumRequests"]["used"], 15)
+        self.assertEqual(snapshot["premiumRequests"]["total"], 100)
+        self.assertEqual(snapshot["premiumRequests"]["plan"], None)
+        self.assertEqual(snapshot["source"], "copilot_usage_other")
+
+    async def test_fetch_usage_snapshot_preserves_authoritative_premium_quota_fields(self) -> None:
+        service = self.service
+        service.github_usage_urls = ("https://api.github.com/copilot_internal/v2/usage",)
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            async def get(self, url, headers=None):
+                return httpx.Response(
+                    200,
+                    json={
+                        "quotas": {
+                            "chat": {"remaining": 18},
+                            "premium_requests": {
+                                "remaining": 3,
+                                "used": 27,
+                                "total": 30,
+                                "plan": "copilot_pro",
+                            },
+                        }
+                    },
+                    request=httpx.Request("GET", url),
+                )
+
+        with patch("services.copilot_auth.httpx.AsyncClient", FakeAsyncClient):
+            snapshot = await service.fetch_usage_snapshot("github-access-token")
+
+        self.assertEqual(snapshot["status"], "ok")
         self.assertEqual(snapshot["premiumRequests"]["remaining"], 3)
+        self.assertEqual(snapshot["premiumRequests"]["used"], 27)
+        self.assertEqual(snapshot["premiumRequests"]["total"], 30)
+        self.assertEqual(snapshot["premiumRequests"]["plan"], "copilot_pro")
+
+    async def test_fetch_usage_snapshot_ignores_zero_total_and_normalizes_remaining_only_premium_quota(self) -> None:
+        service = self.service
+        service.github_usage_urls = ("https://api.github.com/copilot_internal/user",)
+
+        class FakeAsyncClient:
+            def __init__(self, *args, **kwargs) -> None:
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            async def get(self, url, headers=None):
+                return httpx.Response(
+                    200,
+                    json={
+                        "usage": {
+                            "remaining_chat_messages": 100,
+                            "premium_requests_remaining": 83,
+                            "premium_requests_limit": 0,
+                        }
+                    },
+                    request=httpx.Request("GET", url),
+                )
+
+        with patch("services.copilot_auth.httpx.AsyncClient", FakeAsyncClient):
+            snapshot = await service.fetch_usage_snapshot("github-access-token")
+
+        self.assertEqual(snapshot["status"], "ok")
+        self.assertEqual(snapshot["premiumRequests"]["remaining"], 83)
+        self.assertEqual(snapshot["premiumRequests"]["used"], 17)
+        self.assertEqual(snapshot["premiumRequests"]["total"], 100)
         self.assertEqual(snapshot["source"], "copilot_user_api")
 
     async def test_fetch_usage_snapshot_marks_partial_when_only_one_metric_exists(self) -> None:
@@ -495,26 +696,7 @@ class ChatStreamingContractTests(unittest.IsolatedAsyncioTestCase):
             async def is_disconnected(self) -> bool:
                 return False
 
-        class FakeStream:
-            def __init__(self, chunks: list[object]) -> None:
-                self._chunks = chunks
-                self._index = 0
-                self.closed = False
-
-            def __aiter__(self):
-                return self
-
-            async def __anext__(self):
-                if self._index >= len(self._chunks):
-                    raise StopAsyncIteration
-                chunk = self._chunks[self._index]
-                self._index += 1
-                return chunk
-
-            async def aclose(self) -> None:
-                self.closed = True
-
-        fake_stream = FakeStream(
+        fake_stream = FakeCompletionStream(
             [
                 {"choices": [{"delta": {"content": "hello"}}]},
                 {
@@ -549,6 +731,292 @@ class ChatStreamingContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(fake_stream.closed)
         self.assertTrue(payload.rstrip().endswith("data: [DONE]"))
 
+    async def test_stream_uses_original_messages_for_initiator_header(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+
+        class FakeRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        class FakeStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                raise StopAsyncIteration
+
+            async def aclose(self) -> None:
+                return None
+
+        with patch(
+            "services.copilot_chat.litellm.acompletion",
+            AsyncMock(return_value=FakeStream()),
+        ) as acompletion:
+            chunks = [
+                chunk
+                async for chunk in service.stream_chat_completion(
+                    request=FakeRequest(),
+                    model="gpt-5.4",
+                    messages=[
+                        {"role": "system", "content": "guard"},
+                        {"role": "assistant", "content": "reference"},
+                        {"role": "user", "content": "서울 날씨를 검색해보고 알려줘"},
+                    ],
+                    session=make_credential_session(),
+                    initiator_messages=[{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}],
+                )
+            ]
+
+        self.assertTrue(b"".join(chunks).decode("utf-8").rstrip().endswith("data: [DONE]"))
+        self.assertEqual(acompletion.await_args.kwargs["extra_headers"]["X-Initiator"], "user")
+
+
+class ChatSearchPreparationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_prepare_messages_auto_injects_search_context(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            return_value=[
+                WebSearchResult(
+                    title="Seoul weather forecast",
+                    url="https://weather.example/seoul",
+                    snippet="Current temperature and forecast for Seoul.",
+                )
+            ]
+        )
+        messages = [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}]
+
+        prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        service.search_client.search.assert_awaited_once_with("서울 날씨")
+        self.assertEqual(prepared_messages[0]["role"], "system")
+        self.assertNotIn("Seoul weather forecast", prepared_messages[0]["content"])
+        self.assertIn("untrusted external data", prepared_messages[0]["content"])
+        self.assertEqual(prepared_messages[1]["role"], "assistant")
+        self.assertIn("Seoul weather forecast", prepared_messages[1]["content"])
+        self.assertEqual(prepared_messages[2:], messages)
+
+    async def test_prepare_messages_auto_accepts_explicit_english_web_search_request(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            return_value=[
+                WebSearchResult(
+                    title="Seoul weather forecast",
+                    url="https://weather.example/seoul",
+                    snippet="Current temperature and forecast for Seoul.",
+                )
+            ]
+        )
+        messages = [{"role": "user", "content": "please search for Seoul weather and summarize it"}]
+
+        prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        service.search_client.search.assert_awaited_once_with("Seoul weather")
+        self.assertEqual(prepared_messages[2:], messages)
+
+    async def test_prepare_messages_auto_requires_explicit_search_request(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            return_value=[
+                WebSearchResult(
+                    title="Ignored result",
+                    url="https://example.com/ignored",
+                    snippet="ignored",
+                )
+            ]
+        )
+        messages = [{"role": "user", "content": "latest weather in Seoul"}]
+
+        prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        service.search_client.search.assert_not_awaited()
+        self.assertEqual(prepared_messages, messages)
+
+    async def test_prepare_messages_auto_does_not_treat_local_find_analysis_as_web_search(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            return_value=[
+                WebSearchResult(
+                    title="Ignored result",
+                    url="https://example.com/ignored",
+                    snippet="ignored",
+                )
+            ]
+        )
+        messages = [{"role": "user", "content": "find the bug in this code"}]
+
+        prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        service.search_client.search.assert_not_awaited()
+        self.assertEqual(prepared_messages, messages)
+
+    async def test_prepare_messages_auto_does_not_treat_generic_korean_analysis_prompts_as_web_search(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            return_value=[
+                WebSearchResult(
+                    title="Ignored result",
+                    url="https://example.com/ignored",
+                    snippet="ignored",
+                )
+            ]
+        )
+        cases = [
+            "이 코드 버그를 찾아줘",
+            "이 함수 동작 알아봐",
+            "로그인 상태 조회해줘",
+        ]
+
+        for prompt in cases:
+            with self.subTest(prompt=prompt):
+                prepared_messages = await service.prepare_messages_for_completion(
+                    [{"role": "user", "content": prompt}],
+                    search_mode="auto",
+                )
+
+                self.assertEqual(prepared_messages, [{"role": "user", "content": prompt}])
+
+        service.search_client.search.assert_not_awaited()
+
+    async def test_prepare_messages_auto_only_considers_latest_user_message(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            return_value=[
+                WebSearchResult(
+                    title="Ignored result",
+                    url="https://example.com/ignored",
+                    snippet="ignored",
+                )
+            ]
+        )
+        messages = [
+            {"role": "user", "content": "서울 날씨 최신 정보 알려줘"},
+            {"role": "assistant", "content": "먼저 상황을 정리해볼게요."},
+            {"role": "user", "content": "이전 답변을 두 문장으로 요약해줘"},
+        ]
+
+        prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        service.search_client.search.assert_not_awaited()
+        self.assertEqual(prepared_messages, messages)
+
+    async def test_prepare_messages_auto_falls_back_when_search_fails(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            side_effect=httpx.ConnectError(
+                "duckduckgo unreachable",
+                request=httpx.Request("GET", "https://lite.duckduckgo.com/lite/"),
+            )
+        )
+        messages = [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}]
+
+        prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        self.assertEqual(prepared_messages, messages)
+
+
+class ChatLoggingContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_auto_search_failure_logs_scrubbed_warning(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+        service.search_client.search = AsyncMock(
+            side_effect=httpx.ConnectError(
+                "duckduckgo unreachable for https://lite.duckduckgo.com/lite/?q=%EC%84%9C%EC%9A%B8+%EB%82%A0%EC%94%A8",
+                request=httpx.Request("GET", "https://lite.duckduckgo.com/lite/?q=%EC%84%9C%EC%9A%B8+%EB%82%A0%EC%94%A8"),
+            )
+        )
+        messages = [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}]
+
+        with patch("services.copilot_chat.LOGGER.warning") as logger_warning:
+            prepared_messages = await service.prepare_messages_for_completion(messages, search_mode="auto")
+
+        self.assertEqual(prepared_messages, messages)
+        logger_warning.assert_called_once_with(
+            "Auto search failed; continuing without search context (%s)",
+            "network_error",
+        )
+
+    async def test_stream_failure_logs_scrubbed_warning(self) -> None:
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+
+        class FakeRequest:
+            async def is_disconnected(self) -> bool:
+                return False
+
+        with patch("services.copilot_chat.LOGGER.warning") as logger_warning:
+            with patch(
+                "services.copilot_chat.litellm.acompletion",
+                AsyncMock(
+                    side_effect=RuntimeError(
+                        "provider exploded at https://api.githubcopilot.com/chat/completions?query=secret"
+                    )
+                ),
+            ):
+                chunks = [
+                    chunk
+                    async for chunk in service.stream_chat_completion(
+                        request=FakeRequest(),
+                        model="gpt-5.4",
+                        messages=[{"role": "user", "content": "hello"}],
+                        session=make_credential_session(),
+                    )
+                ]
+
+        payload = b"".join(chunks).decode("utf-8")
+        self.assertNotIn("api.githubcopilot.com", payload)
+        self.assertNotIn("query=secret", payload)
+        self.assertTrue(payload.rstrip().endswith("data: [DONE]"))
+        logger_warning.assert_called_once_with(
+            "Copilot chat streaming failed; returning sanitized SSE error (%s)",
+            "internal_error",
+        )
+
+
+class ChatSearchModeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+
+    def test_normalize_search_mode_defaults_to_off(self) -> None:
+        self.assertEqual(self.service.normalize_search_mode(None), "off")
+
+    def test_normalize_search_mode_accepts_explicit_off(self) -> None:
+        self.assertEqual(self.service.normalize_search_mode("off"), "off")
+
+    def test_normalize_search_mode_rejects_blank_string(self) -> None:
+        with self.assertRaisesRegex(CopilotChatRequestError, "검색 모드가 올바르지 않습니다"):
+            self.service.normalize_search_mode("   ")
+
 
 class FrontendUsageContractTests(unittest.TestCase):
     def test_usage_summary_ignores_snapshot_detail_in_ui_code(self) -> None:
@@ -556,6 +1024,58 @@ class FrontendUsageContractTests(unittest.TestCase):
 
         self.assertNotIn("snapshot.detail", source)
         self.assertIn("USAGE_SUMMARY_REASON_MESSAGES", source)
+        self.assertNotIn("USAGE_VISUAL_CONFIG.premiumRequests.total", source)
+        self.assertIn("normalizeUsageQuantity(metric?.total)", source)
+
+    def test_premium_usage_card_prefers_used_percent_when_total_basis_exists(self) -> None:
+        source = (Path(__file__).resolve().parent / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("function formatPremiumUsagePrimaryValue(snapshot, metric)", source)
+        self.assertIn("badge: formatPremiumUsagePrimaryValue(snapshot, metric)", source)
+        self.assertIn("elements.authPremiumRequestsRemaining.textContent = formatPremiumUsagePrimaryValue(usage, usage.premiumRequests);", source)
+        self.assertIn("primaryValue: `${usedPercent}% 사용`", source)
+        self.assertIn("title: `Premium requests ${usedPercent}% 사용`", source)
+        self.assertNotIn("${remainingText}% 남음", source)
+
+    def test_browser_visible_premium_ui_does_not_render_plan_metadata(self) -> None:
+        source = (Path(__file__).resolve().parent / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertNotIn("plan ${metric.plan}", source)
+        self.assertNotIn("return `plan ${metric.plan}`;", source)
+
+
+class FrontendChatContractTests(unittest.TestCase):
+    def test_chat_requests_only_opt_in_auto_search_for_explicit_search_prompts(self) -> None:
+        source = (Path(__file__).resolve().parent / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("resolveSearchModeForPrompt", source)
+        self.assertIn("...(searchMode ? { searchMode } : {})", source)
+        self.assertIn("search\\s+for", source)
+        self.assertIn("find\\s+(?:online|on\\s+the\\s+web)", source)
+        self.assertNotIn("|search(?:\\s+for)?|", source)
+        self.assertNotIn("|find\\s+", source)
+
+    def test_frontend_and_backend_search_triggers_share_same_examples(self) -> None:
+        cases = [
+            ("서울 날씨를 검색해보고 알려줘", "서울 날씨"),
+            ("please search for Seoul weather and summarize it", "Seoul weather"),
+            ("find online Seoul weather and summarize it", "Seoul weather"),
+            ("이 코드 버그를 찾아줘", None),
+            ("이 함수 동작 알아봐", None),
+            ("로그인 상태 조회해줘", None),
+            ("find the bug in this code", None),
+            ("latest weather in Seoul", None),
+        ]
+        service = CopilotChatService(
+            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
+            default_model="gpt-5.4",
+        )
+
+        for prompt, expected_query in cases:
+            expected_mode = "auto" if expected_query else None
+
+            self.assertEqual(resolve_frontend_search_mode_for_prompt(prompt), expected_mode)
+            self.assertEqual(service._extract_search_query(prompt), expected_query)
 
 
 class CopilotApiTests(unittest.TestCase):
@@ -623,10 +1143,16 @@ class CopilotApiTests(unittest.TestCase):
                     "fetchedAt": response.json()["usage"]["fetchedAt"],
                     "chatMessages": {
                         "remaining": None,
+                        "used": None,
+                        "total": None,
+                        "plan": None,
                         "status": "missing",
                     },
                     "premiumRequests": {
                         "remaining": None,
+                        "used": None,
+                        "total": None,
+                        "plan": None,
                         "status": "missing",
                     },
                 },
@@ -651,7 +1177,13 @@ class CopilotApiTests(unittest.TestCase):
     def test_status_with_valid_envelope_includes_usage_snapshot(self) -> None:
         session_secret = self._establish_browser_session()
         envelope = self._issue_envelope(session_secret)
-        usage_snapshot = make_usage_snapshot(chat_remaining=15, premium_remaining=2)
+        usage_snapshot = make_usage_snapshot(
+            chat_remaining=15,
+            premium_remaining=2,
+            premium_total=10,
+            premium_used=8,
+            premium_plan="copilot_pro",
+        )
 
         with patch.object(
             self.main.auth_service,
@@ -670,6 +1202,9 @@ class CopilotApiTests(unittest.TestCase):
         self.assertEqual(payload["credentialId"], "cred-123")
         self.assertEqual(payload["usage"]["chatMessages"]["remaining"], 15)
         self.assertEqual(payload["usage"]["premiumRequests"]["remaining"], 2)
+        self.assertEqual(payload["usage"]["premiumRequests"]["used"], 8)
+        self.assertEqual(payload["usage"]["premiumRequests"]["total"], 10)
+        self.assertEqual(payload["usage"]["premiumRequests"]["plan"], "copilot_pro")
 
     def test_status_usage_failure_keeps_authenticated_state(self) -> None:
         session_secret = self._establish_browser_session()
@@ -742,6 +1277,102 @@ class CopilotApiTests(unittest.TestCase):
         self.assertEqual(payload["code"], "chat_model_not_allowed")
         self.assertEqual(payload["message"], "선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.")
 
+    def test_chat_validation_rejects_unknown_search_mode(self) -> None:
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "credentialEnvelope": "opaque-value",
+                "searchMode": "always",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["code"], "chat_search_mode_invalid")
+        self.assertEqual(payload["message"], "검색 모드가 올바르지 않습니다. 다시 시도하세요.")
+
+    def test_chat_validation_rejects_blank_search_mode(self) -> None:
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "model": "gpt-5.4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "credentialEnvelope": "opaque-value",
+                "searchMode": "   ",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        payload = response.json()
+        self.assertEqual(payload["code"], "chat_search_mode_invalid")
+
+    def test_chat_omitted_search_mode_defaults_to_off_before_streaming(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+        with patch.object(
+            self.main.chat_service,
+            "prepare_messages_for_completion",
+            AsyncMock(return_value=[{"role": "user", "content": "hello"}]),
+        ) as prepare_messages:
+            with patch.object(
+                self.main.chat_service,
+                "stream_chat_completion",
+                fake_stream_chat_completion,
+            ):
+                response = self.client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "credentialEnvelope": envelope,
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        prepare_messages.assert_awaited_once_with(
+            [{"role": "user", "content": "hello"}],
+            search_mode="off",
+        )
+
+    def test_chat_explicit_off_search_mode_keeps_off_before_streaming(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+        with patch.object(
+            self.main.chat_service,
+            "prepare_messages_for_completion",
+            AsyncMock(return_value=[{"role": "user", "content": "hello"}]),
+        ) as prepare_messages:
+            with patch.object(
+                self.main.chat_service,
+                "stream_chat_completion",
+                fake_stream_chat_completion,
+            ):
+                response = self.client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "credentialEnvelope": envelope,
+                        "searchMode": "off",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        prepare_messages.assert_awaited_once_with(
+            [{"role": "user", "content": "hello"}],
+            search_mode="off",
+        )
+
     def test_malformed_request_bodies_return_validation_error_contract(self) -> None:
         cases = [
             ("/api/copilot/status", []),
@@ -768,6 +1399,15 @@ class CopilotApiTests(unittest.TestCase):
                         "message": "요청 형식이 올바르지 않습니다. 다시 시도하세요.",
                     },
                 )
+
+    def test_index_response_uses_versioned_assets_and_no_store_headers(self) -> None:
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('/static/style.css?v=', response.text)
+        self.assertIn('/static/app.js?v=', response.text)
+        self.assertEqual(response.headers.get("cache-control"), "no-store, max-age=0")
+        self.assertEqual(response.headers.get("pragma"), "no-cache")
 
     def test_login_poll_throttles_early_requests_without_upstream_call(self) -> None:
         with patch.object(
@@ -877,7 +1517,13 @@ class CopilotApiTests(unittest.TestCase):
         ):
             start_response = self.client.post("/api/copilot/login/start")
 
-        usage_snapshot = make_usage_snapshot(chat_remaining=9, premium_remaining=1)
+        usage_snapshot = make_usage_snapshot(
+            chat_remaining=9,
+            premium_remaining=1,
+            premium_total=12,
+            premium_used=11,
+            premium_plan="copilot_business",
+        )
         expected_session = make_credential_session()
         login_id = start_response.json()["loginId"]
         session_secret = self.client.cookies.get(self.main.auth_service.session_cookie_name)
@@ -911,6 +1557,9 @@ class CopilotApiTests(unittest.TestCase):
         self.assertEqual(payload["status"], "complete")
         self.assertEqual(payload["usage"]["chatMessages"]["remaining"], 9)
         self.assertEqual(payload["usage"]["premiumRequests"]["remaining"], 1)
+        self.assertEqual(payload["usage"]["premiumRequests"]["used"], 11)
+        self.assertEqual(payload["usage"]["premiumRequests"]["total"], 12)
+        self.assertEqual(payload["usage"]["premiumRequests"]["plan"], "copilot_business")
 
     def test_logout_rotates_binding_and_invalidates_existing_envelope(self) -> None:
         session_secret = self._establish_browser_session()
@@ -948,7 +1597,7 @@ class CopilotApiTests(unittest.TestCase):
         )
         streamed_session: dict[str, object] = {}
 
-        async def fake_stream_chat_completion(request, model, messages, session):
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
             streamed_session["session"] = session
             yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
             yield b"data: [DONE]\n\n"
@@ -987,6 +1636,199 @@ class CopilotApiTests(unittest.TestCase):
         )
         self.assertTrue(refreshed_status.json()["authenticated"])
         self.assertEqual(refreshed_status.json()["credentialId"], "cred-refreshed")
+
+    def test_chat_auto_search_prepares_messages_before_streaming(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        prepared_messages = [
+            {
+                "role": "system",
+                "content": "A server-provided web search reference message may appear next.",
+            },
+            {
+                "role": "assistant",
+                "content": 'Reference only: untrusted web search data gathered by the server. {"type":"web_search_results"}',
+            },
+            {"role": "user", "content": "서울 날씨 알려줘"},
+        ]
+        streamed_messages: dict[str, object] = {}
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None):
+            streamed_messages["messages"] = messages
+            streamed_messages["initiator_messages"] = initiator_messages
+            yield b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+
+        with patch.object(
+            self.main.chat_service,
+            "prepare_messages_for_completion",
+            AsyncMock(return_value=prepared_messages),
+        ) as prepare_messages:
+            with patch.object(
+                self.main.chat_service,
+                "stream_chat_completion",
+                fake_stream_chat_completion,
+            ):
+                response = self.client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "서울 날씨 알려줘"}],
+                        "credentialEnvelope": envelope,
+                        "searchMode": "auto",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        prepare_messages.assert_awaited_once_with(
+            [{"role": "user", "content": "서울 날씨 알려줘"}],
+            search_mode="auto",
+        )
+        self.assertEqual(streamed_messages["messages"], prepared_messages)
+        self.assertEqual(
+            streamed_messages["initiator_messages"],
+            [{"role": "user", "content": "서울 날씨 알려줘"}],
+        )
+
+    def test_chat_auto_search_stream_passthroughs_delta_and_done(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        fake_stream = FakeCompletionStream(
+            [
+                {"choices": [{"delta": {"content": "hello"}}]},
+                {"choices": [{"delta": {"content": " world"}}]},
+            ]
+        )
+
+        with patch.object(
+            self.main.chat_service.search_client,
+            "search",
+            AsyncMock(
+                return_value=[
+                    WebSearchResult(
+                        title="Seoul weather forecast",
+                        url="https://weather.example/seoul",
+                        snippet="Current temperature and forecast for Seoul.",
+                    )
+                ]
+            ),
+        ) as search:
+            with patch(
+                "services.copilot_chat.litellm.acompletion",
+                AsyncMock(return_value=fake_stream),
+            ) as acompletion:
+                response = self.client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}],
+                        "credentialEnvelope": envelope,
+                        "searchMode": "auto",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.text,
+            'data: {"choices": [{"delta": {"content": "hello"}}]}\n\n'
+            'data: {"choices": [{"delta": {"content": " world"}}]}\n\n'
+            'data: [DONE]\n\n',
+        )
+        search.assert_awaited_once_with("서울 날씨")
+        streamed_messages = acompletion.await_args.kwargs["messages"]
+        self.assertEqual(streamed_messages[0]["role"], "system")
+        self.assertEqual(streamed_messages[1]["role"], "assistant")
+        self.assertEqual(streamed_messages[2:], [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}])
+        self.assertTrue(fake_stream.closed)
+
+    def test_chat_auto_search_stream_error_returns_sanitized_sse_and_done(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        fake_stream = FakeCompletionStream(
+            [
+                {"choices": [{"delta": {"content": "hello"}}]},
+                {
+                    "error": {"message": "provider exploded", "type": "upstream_error"},
+                    "detail": "https://api.githubcopilot.com/chat/completions?query=secret",
+                },
+            ]
+        )
+
+        with patch.object(
+            self.main.chat_service.search_client,
+            "search",
+            AsyncMock(
+                return_value=[
+                    WebSearchResult(
+                        title="Seoul weather forecast",
+                        url="https://weather.example/seoul",
+                        snippet="Current temperature and forecast for Seoul.",
+                    )
+                ]
+            ),
+        ):
+            with patch(
+                "services.copilot_chat.litellm.acompletion",
+                AsyncMock(return_value=fake_stream),
+            ):
+                response = self.client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}],
+                        "credentialEnvelope": envelope,
+                        "searchMode": "auto",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('data: {"choices": [{"delta": {"content": "hello"}}]}', response.text)
+        self.assertIn(
+            'data: {"code": "copilot_chat_stream_failed", "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}',
+            response.text,
+        )
+        self.assertNotIn("provider exploded", response.text)
+        self.assertNotIn("api.githubcopilot.com", response.text)
+        self.assertTrue(response.text.endswith("data: [DONE]\n\n"))
+        self.assertTrue(fake_stream.closed)
+
+    def test_chat_auto_search_empty_results_falls_back_to_ordinary_chat(self) -> None:
+        session_secret = self._establish_browser_session()
+        envelope = self._issue_envelope(session_secret)
+        fake_stream = FakeCompletionStream(
+            [
+                {"choices": [{"delta": {"content": "ordinary"}}]},
+            ]
+        )
+        original_messages = [{"role": "user", "content": "서울 날씨를 검색해보고 알려줘"}]
+
+        with patch.object(
+            self.main.chat_service.search_client,
+            "search",
+            AsyncMock(return_value=[]),
+        ) as search:
+            with patch(
+                "services.copilot_chat.litellm.acompletion",
+                AsyncMock(return_value=fake_stream),
+            ) as acompletion:
+                response = self.client.post(
+                    "/api/chat",
+                    json={
+                        "model": "gpt-5.4",
+                        "messages": original_messages,
+                        "credentialEnvelope": envelope,
+                        "searchMode": "auto",
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.text,
+            'data: {"choices": [{"delta": {"content": "ordinary"}}]}\n\n'
+            'data: [DONE]\n\n',
+        )
+        search.assert_awaited_once_with("서울 날씨")
+        self.assertEqual(acompletion.await_args.kwargs["messages"], original_messages)
+        self.assertTrue(fake_stream.closed)
 
 
 if __name__ == "__main__":

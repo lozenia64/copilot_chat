@@ -9,6 +9,7 @@ const SERVER_ERROR_MESSAGES = Object.freeze({
     chat_messages_invalid: "채팅 메시지 형식이 올바르지 않습니다. 다시 시도하세요.",
     chat_model_not_allowed: "선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
     chat_model_required: "채팅 모델을 확인할 수 없습니다. 다시 시도하세요.",
+    chat_search_mode_invalid: "검색 모드가 올바르지 않습니다. 다시 시도하세요.",
     copilot_access_token_failed: "GitHub 인증을 완료하지 못했습니다. 다시 시도하세요.",
     copilot_access_token_missing: "GitHub 액세스 토큰을 가져오지 못했습니다.",
     copilot_access_token_unreachable: "GitHub 로그인 상태를 확인하지 못했습니다. 잠시 후 다시 시도하세요.",
@@ -46,6 +47,27 @@ const COMPOSER_STATUS_HOLD_MS = 2600;
 const MOBILE_VIEWPORT_MAX_WIDTH = 960;
 const COMPACT_VIEWPORT_MAX_HEIGHT = 720;
 const SIDEBAR_OVERLAY_HIDE_DELAY_MS = 180;
+const SIDEBAR_COLLAPSE_STORAGE_KEY = "localChatSidebarCollapsed";
+const EXPLICIT_SEARCH_PATTERNS = Object.freeze([
+    /^.+?(?:를|을)?\s*(?:웹\s*)?검색(?:\s*$|해|해서|해보|해봐|해보고|해\s*줘|해주세요|해주|해\s*줄래).*$/u,
+    /^(?:please\s+)?web\s+search(?:\s+for)?\s+.+$/i,
+    /^(?:please\s+)?search\s+for\s+.+$/i,
+    /^(?:please\s+)?look\s+up\s+.+$/i,
+    /^(?:please\s+)?find\s+(?:online|on\s+the\s+web)\s+.+$/i,
+]);
+const USAGE_VISUAL_CONFIG = Object.freeze({
+    chatMessages: { low: 5, medium: 20, high: 60 },
+});
+
+function createEmptyUsageMetric() {
+    return {
+        remaining: null,
+        used: null,
+        total: null,
+        plan: null,
+        status: "missing",
+    };
+}
 
 function createEmptyUsageSnapshot(reason = "not_authenticated") {
     return {
@@ -54,14 +76,8 @@ function createEmptyUsageSnapshot(reason = "not_authenticated") {
         detail: null,
         source: null,
         fetchedAt: 0,
-        chatMessages: {
-            remaining: null,
-            status: "missing",
-        },
-        premiumRequests: {
-            remaining: null,
-            status: "missing",
-        },
+        chatMessages: createEmptyUsageMetric(),
+        premiumRequests: createEmptyUsageMetric(),
     };
 }
 
@@ -74,6 +90,7 @@ const state = {
     ui: {
         isCompactUsage: false,
         isUsageSummaryCollapsed: false,
+        isSidebarCollapsed: window.localStorage.getItem(SIDEBAR_COLLAPSE_STORAGE_KEY) === "true",
         sidebarOverlayTimerId: null,
     },
     composerStatus: {
@@ -104,6 +121,7 @@ const state = {
 };
 
 const elements = {
+    appShell: document.getElementById("appShell"),
     sessionList: document.getElementById("sessionList"),
     messages: document.getElementById("messages"),
     newChatButton: document.getElementById("newChatButton"),
@@ -118,9 +136,13 @@ const elements = {
     usageSummary: document.getElementById("usageSummary"),
     usageSummaryPanel: document.getElementById("usageSummaryPanel"),
     usageSummaryToggle: document.getElementById("usageSummaryToggle"),
+    chatMessagesCard: document.getElementById("chatMessagesCard"),
     chatMessagesRemaining: document.getElementById("chatMessagesRemaining"),
+    chatMessagesChartFill: document.getElementById("chatMessagesChartFill"),
     chatMessagesMeta: document.getElementById("chatMessagesMeta"),
+    premiumRequestsCard: document.getElementById("premiumRequestsCard"),
     premiumRequestsRemaining: document.getElementById("premiumRequestsRemaining"),
+    premiumRequestsChartFill: document.getElementById("premiumRequestsChartFill"),
     premiumRequestsMeta: document.getElementById("premiumRequestsMeta"),
     usageSummaryDetail: document.getElementById("usageSummaryDetail"),
     streamStatus: document.getElementById("streamStatus"),
@@ -143,6 +165,7 @@ const elements = {
     sidebar: document.getElementById("sidebar"),
     sidebarOverlay: document.getElementById("sidebarOverlay"),
     menuButton: document.getElementById("menuButton"),
+    toggleSidebarButton: document.getElementById("toggleSidebarButton"),
     closeMenuButton: document.getElementById("closeMenuButton"),
 };
 
@@ -259,6 +282,12 @@ function renderSidebar() {
         button.type = "button";
         button.className = `session-item${session.id === state.activeSessionId ? " active" : ""}`;
         button.setAttribute("role", "listitem");
+        button.title = session.title;
+        button.setAttribute("aria-label", session.title);
+
+        const abbreviation = document.createElement("span");
+        abbreviation.className = "session-abbr";
+        abbreviation.textContent = (session.title.trim().charAt(0) || "새").toUpperCase();
 
         const title = document.createElement("span");
         title.className = "session-title";
@@ -269,7 +298,7 @@ function renderSidebar() {
         const lastMessage = session.messages.at(-1);
         preview.textContent = lastMessage ? truncateText(lastMessage.content.replace(/\s+/g, " "), 60) : "대화를 시작해 보세요.";
 
-        button.append(title, preview);
+        button.append(abbreviation, title, preview);
         button.addEventListener("click", () => selectSession(session.id));
         fragment.appendChild(button);
     });
@@ -375,6 +404,15 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
+}
+
+function resolveSearchModeForPrompt(content) {
+    const normalized = typeof content === "string" ? content.trim() : "";
+    if (!normalized) {
+        return null;
+    }
+
+    return EXPLICIT_SEARCH_PATTERNS.some((pattern) => pattern.test(normalized)) ? "auto" : null;
 }
 
 function renderInlineHtml(text) {
@@ -555,9 +593,45 @@ function syncUsageSummaryLayout(viewport = getViewportLayout()) {
     elements.usageSummary.dataset.compact = isCompactUsage ? "true" : "false";
     elements.usageSummary.dataset.collapsed = state.ui.isUsageSummaryCollapsed ? "true" : "false";
     elements.usageSummaryToggle.hidden = !isCompactUsage;
-    elements.usageSummaryPanel.hidden = isCompactUsage && state.ui.isUsageSummaryCollapsed;
+    elements.usageSummaryPanel.hidden = false;
+    elements.usageSummaryPanel.setAttribute("aria-hidden", String(isCompactUsage && state.ui.isUsageSummaryCollapsed));
     elements.usageSummaryToggle.setAttribute("aria-expanded", String(!state.ui.isUsageSummaryCollapsed));
-    elements.usageSummaryToggle.textContent = state.ui.isUsageSummaryCollapsed ? "펼치기" : "접기";
+    const toggleLabel = state.ui.isUsageSummaryCollapsed ? "사용량 요약 펼치기" : "사용량 요약 접기";
+    elements.usageSummaryToggle.setAttribute("aria-label", toggleLabel);
+    elements.usageSummaryToggle.title = toggleLabel;
+}
+
+function syncSidebarLayout(viewport = getViewportLayout()) {
+    const isDesktopCollapsed = !viewport.usesOverlaySidebar && state.ui.isSidebarCollapsed;
+    elements.appShell?.classList.toggle("sidebar-collapsed", isDesktopCollapsed);
+
+    if (elements.toggleSidebarButton) {
+        const label = isDesktopCollapsed ? "사이드바 펼치기" : "사이드바 접기";
+        elements.toggleSidebarButton.setAttribute("aria-label", label);
+        elements.toggleSidebarButton.title = label;
+        elements.toggleSidebarButton.setAttribute("aria-pressed", String(isDesktopCollapsed));
+    }
+}
+
+function setDesktopSidebarCollapsed(nextCollapsed) {
+    state.ui.isSidebarCollapsed = Boolean(nextCollapsed);
+    window.localStorage.setItem(SIDEBAR_COLLAPSE_STORAGE_KEY, String(state.ui.isSidebarCollapsed));
+    syncSidebarLayout();
+}
+
+function toggleSidebar() {
+    const viewport = getViewportLayout();
+    if (viewport.usesOverlaySidebar) {
+        if (elements.sidebar?.classList.contains("open")) {
+            closeSidebar();
+            return;
+        }
+
+        openSidebar();
+        return;
+    }
+
+    setDesktopSidebarCollapsed(!state.ui.isSidebarCollapsed);
 }
 
 function clearSidebarOverlayTimer() {
@@ -572,6 +646,7 @@ function clearSidebarOverlayTimer() {
 function syncResponsiveLayout() {
     const viewport = getViewportLayout();
     syncUsageSummaryLayout(viewport);
+    syncSidebarLayout(viewport);
 
     if (!viewport.usesOverlaySidebar) {
         closeSidebar({ immediate: true });
@@ -620,12 +695,35 @@ function describeTimestamp(timestamp) {
     });
 }
 
+function normalizeUsageQuantity(value) {
+    const quantity = value === null || value === undefined ? NaN : Number(value);
+    return Number.isFinite(quantity) ? quantity : null;
+}
+
+function normalizeUsagePlan(value) {
+    if (typeof value === "string") {
+        const normalized = value.trim();
+        return normalized || null;
+    }
+
+    if (typeof value === "number" && Number.isFinite(value)) {
+        return String(value);
+    }
+
+    return null;
+}
+
 function normalizeUsageMetric(metric) {
-    const remainingValue = metric?.remaining;
-    const remaining = remainingValue === null || remainingValue === undefined ? NaN : Number(remainingValue);
+    const remaining = normalizeUsageQuantity(metric?.remaining);
+    const used = normalizeUsageQuantity(metric?.used);
+    const total = normalizeUsageQuantity(metric?.total);
+    const hasQuotaBasis = remaining !== null || used !== null || total !== null;
     return {
-        remaining: Number.isFinite(remaining) ? remaining : null,
-        status: metric?.status === "available" ? "available" : "missing",
+        remaining,
+        used,
+        total,
+        plan: normalizeUsagePlan(metric?.plan),
+        status: hasQuotaBasis ? "available" : "missing",
     };
 }
 
@@ -665,15 +763,204 @@ function normalizeUsageSnapshot(snapshot) {
     };
 }
 
-function formatUsageRemaining(metric) {
-    if (!metric || !Number.isFinite(metric.remaining)) {
-        return "-";
+function formatUsageCount(value) {
+    if (!Number.isFinite(Number(value))) {
+        return null;
     }
 
-    return new Intl.NumberFormat("en-US").format(metric.remaining);
+    return new Intl.NumberFormat("en-US").format(Number(value));
 }
 
-function describeUsageMetric(snapshot, metric) {
+function formatUsageRemaining(metric) {
+    return formatUsageCount(metric?.remaining) ?? "-";
+}
+
+function isUnlimitedChatMessages(snapshot, metric) {
+    return Boolean(
+        snapshot?.source === "copilot_user_api"
+        && metric?.status === "available"
+        && Number(metric?.remaining) === 0
+        && Number.isFinite(snapshot?.premiumRequests?.remaining),
+    );
+}
+
+function resolvePremiumUsagePercent(metric) {
+    const total = normalizeUsageQuantity(metric?.total);
+    if (total === null || total <= 0) {
+        return null;
+    }
+
+    const used = normalizeUsageQuantity(metric?.used);
+    if (used !== null) {
+        return Math.round(Math.min(100, Math.max(0, (used / total) * 100)));
+    }
+
+    const remaining = normalizeUsageQuantity(metric?.remaining);
+    if (remaining === null) {
+        return null;
+    }
+
+    return Math.round(Math.min(100, Math.max(0, ((total - remaining) / total) * 100)));
+}
+
+function getPremiumUsagePresentation(snapshot, metric) {
+    const usedPercent = resolvePremiumUsagePercent(metric);
+    if (usedPercent !== null) {
+        return {
+            primaryValue: `${usedPercent}% 사용`,
+            title: `Premium requests ${usedPercent}% 사용`,
+            usedPercent,
+        };
+    }
+
+    const remainingText = formatUsageCount(metric?.remaining);
+    const totalText = formatUsageCount(metric?.total);
+    const titleParts = [];
+
+    if (Number.isFinite(metric?.remaining) && metric.remaining <= 0) {
+        titleParts.push("소진");
+    } else {
+        titleParts.push(formatUsageRemaining(metric) === "-" ? "확인됨" : `${formatUsageRemaining(metric)} 남음`);
+    }
+
+    if (remainingText) {
+        titleParts.push(`${remainingText}개 남음`);
+    } else if (totalText) {
+        titleParts.push(`총 ${totalText}`);
+    }
+
+    return {
+        primaryValue: titleParts[0] ?? "확인됨",
+        title: titleParts.length === 0 ? "Premium requests server snapshot" : `Premium requests ${titleParts.join(", ")}`,
+        usedPercent,
+    };
+}
+
+function formatPremiumUsagePrimaryValue(snapshot, metric) {
+    return getPremiumUsagePresentation(snapshot, metric).primaryValue;
+}
+
+function describePremiumUsageTitle(snapshot, metric) {
+    const presentation = getPremiumUsagePresentation(snapshot, metric);
+    if (!presentation.title) {
+        return "Premium requests server snapshot";
+    }
+
+    return presentation.title;
+}
+
+function getUsageVisual(metricKey, snapshot, metric) {
+    const config = USAGE_VISUAL_CONFIG[metricKey];
+
+    if (metric.status !== "available") {
+        const isConnected = state.copilot.status === "connected";
+        return {
+            badge: isConnected ? "대기" : "로그인 필요",
+            level: "missing",
+            ratio: 0.12,
+            title: isConnected ? "사용량 스냅샷 대기 중" : "GitHub Copilot 로그인 필요",
+        };
+    }
+
+    if (metricKey === "chatMessages" && isUnlimitedChatMessages(snapshot, metric)) {
+        return {
+            badge: "무제한",
+            level: "unlimited",
+            ratio: 1,
+            title: "Included chat messages",
+        };
+    }
+
+    if (metricKey === "premiumRequests") {
+        const premiumPresentation = getPremiumUsagePresentation(snapshot, metric);
+        if (premiumPresentation.usedPercent !== null) {
+            let level = "high";
+            if (premiumPresentation.usedPercent >= 85) {
+                level = "low";
+            } else if (premiumPresentation.usedPercent >= 50) {
+                level = "medium";
+            }
+
+            return {
+                badge: formatPremiumUsagePrimaryValue(snapshot, metric),
+                level,
+                ratio: premiumPresentation.usedPercent / 100,
+                title: describePremiumUsageTitle(snapshot, metric),
+            };
+        }
+
+        if (Number.isFinite(metric.remaining) && metric.remaining <= 0) {
+            return {
+                badge: "소진",
+                level: "empty",
+                ratio: 0,
+                title: describePremiumUsageTitle(snapshot, metric),
+            };
+        }
+
+        return {
+            badge: formatPremiumUsagePrimaryValue(snapshot, metric),
+            level: "indeterminate",
+            ratio: 0.18,
+            title: describePremiumUsageTitle(snapshot, metric),
+        };
+    }
+
+    if (!Number.isFinite(metric.remaining)) {
+        return {
+            badge: "확인됨",
+            level: "indeterminate",
+            ratio: 0.18,
+            title: "Chat messages server snapshot",
+        };
+    }
+
+    if (metric.remaining <= 0) {
+        return {
+            badge: "소진",
+            level: "empty",
+            ratio: 0,
+            title: `잔여 수량 0`,
+        };
+    }
+
+    if (metric.remaining <= config.low) {
+        return {
+            badge: "주의",
+            level: "low",
+            ratio: Math.max(0.16, metric.remaining / config.high),
+            title: `잔여 수량 ${formatUsageRemaining(metric)}`,
+        };
+    }
+
+    if (metric.remaining <= config.medium) {
+        return {
+            badge: "보통",
+            level: "medium",
+            ratio: Math.max(0.34, metric.remaining / config.high),
+            title: `잔여 수량 ${formatUsageRemaining(metric)}`,
+        };
+    }
+
+    return {
+        badge: "여유",
+        level: "high",
+        ratio: Math.min(1, Math.max(0.58, metric.remaining / config.high)),
+        title: `잔여 수량 ${formatUsageRemaining(metric)}`,
+    };
+}
+
+function applyUsageMetricVisual(cardElement, badgeElement, fillElement, metaElement, metricKey, snapshot, metric) {
+    const visual = getUsageVisual(metricKey, snapshot, metric);
+    cardElement.dataset.level = visual.level;
+    cardElement.title = visual.title;
+    badgeElement.textContent = visual.badge;
+    badgeElement.setAttribute("aria-label", `${metricKey} 상태 ${visual.badge}`);
+    fillElement.style.width = `${Math.round(visual.ratio * 100)}%`;
+    metaElement.textContent = describeUsageMetric(snapshot, metricKey, metric);
+}
+
+function describeUsageMetric(snapshot, metricKey, metric) {
     if (metric.status === "available") {
         return "server snapshot";
     }
@@ -714,14 +1001,28 @@ function renderUsageSummary() {
     state.copilot.usage = usage;
 
     elements.usageSummary.dataset.status = usage.status;
-    elements.chatMessagesRemaining.textContent = formatUsageRemaining(usage.chatMessages);
-    elements.chatMessagesMeta.textContent = describeUsageMetric(usage, usage.chatMessages);
-    elements.premiumRequestsRemaining.textContent = formatUsageRemaining(usage.premiumRequests);
-    elements.premiumRequestsMeta.textContent = describeUsageMetric(usage, usage.premiumRequests);
+    applyUsageMetricVisual(
+        elements.chatMessagesCard,
+        elements.chatMessagesRemaining,
+        elements.chatMessagesChartFill,
+        elements.chatMessagesMeta,
+        "chatMessages",
+        usage,
+        usage.chatMessages,
+    );
+    applyUsageMetricVisual(
+        elements.premiumRequestsCard,
+        elements.premiumRequestsRemaining,
+        elements.premiumRequestsChartFill,
+        elements.premiumRequestsMeta,
+        "premiumRequests",
+        usage,
+        usage.premiumRequests,
+    );
     elements.usageSummaryDetail.textContent = describeUsageSummary(usage);
 
     elements.authChatMessagesRemaining.textContent = formatUsageRemaining(usage.chatMessages);
-    elements.authPremiumRequestsRemaining.textContent = formatUsageRemaining(usage.premiumRequests);
+    elements.authPremiumRequestsRemaining.textContent = formatPremiumUsagePrimaryValue(usage, usage.premiumRequests);
     elements.authUsageDetail.textContent = describeUsageSummary(usage);
     syncUsageSummaryLayout();
 }
@@ -1073,6 +1374,7 @@ function renderAuthState() {
 
     statusText.textContent = nextStatusLabel;
     button.setAttribute("aria-label", `GitHub Copilot 상태: ${nextStatusLabel}`);
+    button.title = `GitHub Copilot 상태: ${nextStatusLabel}`;
     renderUsageSummary();
 
     elements.authModal.classList.toggle("hidden", !copilot.modalOpen);
@@ -1399,6 +1701,7 @@ async function sendPrompt() {
     updateComposerControls();
     syncComposerStatus();
     let shouldRefreshUsage = false;
+    const searchMode = resolveSearchModeForPrompt(content);
 
     try {
         const response = await fetch("/api/chat", {
@@ -1410,6 +1713,7 @@ async function sendPrompt() {
                 model: session.model || DEFAULT_MODEL,
                 messages: requestMessages,
                 credentialEnvelope: state.copilot.envelope,
+                ...(searchMode ? { searchMode } : {}),
             }),
             signal: state.abortController.signal,
         });
@@ -1527,7 +1831,8 @@ function closeSidebar(options = {}) {
 }
 
 function bindEvents() {
-    if (elements.menuButton) elements.menuButton.addEventListener("click", openSidebar);
+    if (elements.menuButton) elements.menuButton.addEventListener("click", toggleSidebar);
+    if (elements.toggleSidebarButton) elements.toggleSidebarButton.addEventListener("click", toggleSidebar);
     if (elements.closeMenuButton) elements.closeMenuButton.addEventListener("click", closeSidebar);
     if (elements.sidebarOverlay) elements.sidebarOverlay.addEventListener("click", closeSidebar);
 

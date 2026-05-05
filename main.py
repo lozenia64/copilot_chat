@@ -7,7 +7,7 @@ from typing import Any
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, Response
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -18,6 +18,7 @@ from services.copilot_chat import CopilotChatRequestError, CopilotChatService
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH = BASE_DIR / "litellm_config.yaml"
+INDEX_PATH = STATIC_DIR / "index.html"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -28,6 +29,23 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 auth_service = CopilotAuthService()
 chat_service = CopilotChatService(config_path=CONFIG_PATH, default_model=DEFAULT_MODEL)
+
+
+def _build_index_html() -> str:
+    style_version = int((STATIC_DIR / "style.css").stat().st_mtime)
+    app_version = int((STATIC_DIR / "app.js").stat().st_mtime)
+    index_html = INDEX_PATH.read_text(encoding="utf-8")
+    index_html = index_html.replace(
+        "/static/style.css",
+        f"/static/style.css?v={style_version}",
+        1,
+    )
+    index_html = index_html.replace(
+        "/static/app.js",
+        f"/static/app.js?v={app_version}",
+        1,
+    )
+    return index_html
 
 
 class CopilotEnvelopeRequest(BaseModel):
@@ -42,6 +60,7 @@ class ChatRequest(BaseModel):
     model: str | None = None
     messages: list[dict[str, Any]]
     credentialEnvelope: str | None = None
+    searchMode: str | None = None
 
 
 @app.exception_handler(CopilotAuthError)
@@ -64,8 +83,14 @@ async def handle_request_validation_error(_: Request, __: RequestValidationError
 
 
 @app.get("/")
-async def index() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+async def index() -> HTMLResponse:
+    return HTMLResponse(
+        content=_build_index_html(),
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
 
 
 @app.get("/api/models")
@@ -122,6 +147,7 @@ async def chat(request: Request, payload: ChatRequest):
 
     try:
         model, messages = chat_service.validate_chat_request(payload.model, payload.messages)
+        search_mode = chat_service.normalize_search_mode(payload.searchMode)
     except CopilotChatRequestError as exc:
         return JSONResponse(
             status_code=400,
@@ -133,13 +159,18 @@ async def chat(request: Request, payload: ChatRequest):
         payload.credentialEnvelope,
         session_secret,
     )
+    prepared_messages = await chat_service.prepare_messages_for_completion(
+        messages,
+        search_mode=search_mode,
+    )
 
     stream_response = StreamingResponse(
         chat_service.stream_chat_completion(
             request=request,
             model=model,
-            messages=messages,
+            messages=prepared_messages,
             session=copilot_session,
+            initiator_messages=messages,
         ),
         media_type="text/event-stream",
         headers={

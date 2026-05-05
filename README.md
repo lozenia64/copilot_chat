@@ -10,7 +10,8 @@ The app does not require the old LiteLLM proxy. It builds Copilot request header
 - Starts GitHub device login and polls for completion through FastAPI endpoints.
 - Encrypts the GitHub access token and Copilot API token into a browser-stored credential envelope.
 - Binds that envelope to a per-browser-session cookie so it cannot be replayed from another browser session.
-- Fetches a best-effort server-side usage snapshot for the logged-in Copilot account and shows remaining Chat messages and Premium requests in the UI when GitHub returns recognizable data.
+- Fetches a best-effort server-side usage snapshot for the logged-in Copilot account and shows remaining Chat messages plus a consistent Premium requests summary across the main usage cards and the auth modal when GitHub returns recognizable data.
+- Detects only explicit opt-in web-search intent from the latest user message and, in `searchMode: "auto"`, performs a server-side DuckDuckGo prefetch with a minimized query before LiteLLM streaming.
 - Streams chat completions back to the browser as Server-Sent Events (SSE).
 - Uses `litellm_config.yaml` as a safe allow-list for selectable model IDs.
 
@@ -92,7 +93,7 @@ Notes about runtime behavior:
 5. The browser polls `POST /api/copilot/login/poll` using a rotating `loginId` handle and server-provided backoff.
 6. When GitHub login completes, the server exchanges the GitHub token for a Copilot API token, encrypts the credential session, and returns a browser-bound envelope plus a best-effort usage snapshot.
 7. `POST /api/copilot/status` decrypts the envelope for the current browser session and, when valid, tries to fetch a fresh usage snapshot from GitHub.
-8. `POST /api/chat` decrypts the envelope, refreshes tokens if needed, and streams LiteLLM output as SSE.
+8. `POST /api/chat` decrypts the envelope, refreshes tokens if needed, optionally performs server-side web search in `searchMode: "auto"`, injects a static server guard plus a lower-trust reference message, and then streams LiteLLM output as SSE.
 9. `POST /api/copilot/logout` rotates the binding cookie so previously issued envelopes become invalid.
 
 Authentication success and usage availability are separate outcomes. A browser session can be authenticated and still receive `usage.status = partial` or `usage.status = unavailable`.
@@ -105,7 +106,25 @@ Authentication success and usage availability are separate outcomes. A browser s
 - `POST /api/copilot/login/start`: starts GitHub device login and returns `loginId`, `userCode`, verification URLs, and poll timing.
 - `POST /api/copilot/login/poll`: polls login completion and returns either a pending payload with updated poll timing or a completed credential envelope plus a best-effort usage snapshot.
 - `POST /api/copilot/logout`: rotates the browser-session binding and reports `authenticated: false`.
-- `POST /api/chat`: validates the requested model and message list, then streams SSE chat chunks. If a token refresh happens, the response includes `X-Copilot-Credential-Envelope`.
+- `POST /api/chat`: validates the requested model and message list, optionally accepts `searchMode`, and then streams SSE chat chunks. If a token refresh happens, the response includes `X-Copilot-Credential-Envelope`.
+
+`POST /api/chat` request body shape:
+
+```json
+{
+	"model": "gpt-5.4",
+	"messages": [{ "role": "user", "content": "서울 날씨를 검색해보고 알려줘" }],
+	"credentialEnvelope": "opaque-envelope",
+	"searchMode": "auto"
+}
+```
+
+- `searchMode` is optional. The only accepted values are `auto`, `off`, or omission. Blank and whitespace-only values are rejected as invalid.
+- The browser only sends `searchMode: "auto"` for explicit search requests that say `검색` in Korean, such as `서울 날씨를 검색해보고 알려줘`, or explicit English web-search phrases such as `search for Seoul weather`.
+- Generic local-analysis prompts such as `이 코드 버그를 찾아줘`, `이 함수 동작 알아봐`, `로그인 상태 조회해줘`, or `find the bug in this code` do not opt into external search.
+- In `auto`, the server only considers the latest `user` message, extracts a minimized query from explicit search phrasing, and sends only that minimized query to DuckDuckGo.
+- Search results are never injected into the `system` role. A static server-controlled system guard is allowed, and the untrusted external titles, URLs, and snippets are passed only in a lower-trust reference message. `X-Initiator` is still computed from the original conversation messages.
+- If DuckDuckGo is unreachable or the HTML shape is not recognized, `auto` silently falls back to ordinary chat. The SSE error and `[DONE]` contract stays unchanged.
 
 HTTP JSON error contract for `login/start`, `login/poll`, `chat`, and other non-status failures:
 
@@ -142,7 +161,7 @@ data: {"code":"copilot_chat_stream_failed","message":"채팅 응답을 생성하
 
 Usage snapshot shape:
 
-The usage payload is a best-effort server-side snapshot derived from undocumented GitHub internal endpoints. It is useful for UI display, but it is not treated as a guaranteed or authoritative quota contract.
+The usage payload is still a best-effort server-side snapshot derived from undocumented GitHub internal endpoints. When GitHub returns authoritative premium quota fields such as `total`, `used`, and `plan`, the server preserves them instead of replacing them with a client-side estimate. When any usage source exposes only premium `remaining` in the `0..100` range and omits premium `used` plus `total`, the server treats that value as percent remaining and normalizes it onto a `total = 100` basis.
 
 ```json
 {
@@ -153,22 +172,32 @@ The usage payload is a best-effort server-side snapshot derived from undocumente
 	"fetchedAt": 1714800000.0,
 	"chatMessages": {
 		"remaining": 42,
+		"used": null,
+		"total": null,
+		"plan": null,
 		"status": "available | missing"
 	},
 	"premiumRequests": {
 		"remaining": 7,
+		"used": 23,
+		"total": 30,
+		"plan": "copilot_pro",
 		"status": "available | missing"
 	}
 }
 ```
 
-- `ok`: both remaining counts were found.
-- `partial`: GitHub returned a usage payload, but only one metric could be normalized. `detail` is the fixed message `GitHub Copilot 사용량 정보 일부만 확인되었습니다.`
+- `ok`: both metrics exposed usable quota basis fields.
+- `partial`: GitHub returned a usage payload, but only one metric exposed usable quota basis fields. `detail` is the fixed message `GitHub Copilot 사용량 정보 일부만 확인되었습니다.`
 - `unavailable`: the user is unauthenticated or GitHub did not return a usable usage payload.
+- `premiumRequests.total`, `premiumRequests.used`, and `premiumRequests.plan` are preserved when the upstream payload exposes them.
+- For any `source`, if premium usage only exposes `remaining` in the `0..100` range and omits authoritative `used` plus `total`, the server interprets that as percent remaining and normalizes `premiumRequests.total = 100` and `premiumRequests.used = 100 - remaining`.
+- The browser shows Premium requests with the same percent-first primary value in both the main summary card and the auth modal whenever the server provides a usable total basis, including those normalized remaining-only runtime snapshots. If the server cannot establish a reliable total basis, the UI falls back to remaining counts or generic snapshot state.
 - `detail` is `null` for `not_authenticated`, `copilot_usage_pending`, and `copilot_usage_ok`.
 - `detail` is a fixed user-facing message for `copilot_usage_partial`, `copilot_usage_unavailable`, `copilot_usage_auth_failed`, and `copilot_usage_shape_unrecognized`.
 - `source` is a normalized server enum, never a raw upstream URL.
 - The browser UI does not render `detail` verbatim; it maps normalized `reason` and `status` values to fixed summary text.
+- The browser UI does not render premium `plan` or tier metadata in visible labels, tooltips, or meta text.
 - A successful login can still return `partial` or `unavailable`; that does not by itself mean the browser is logged out.
 
 ## Configuration
@@ -225,8 +254,12 @@ The current suite covers:
 - replay safety for older `loginId` handles
 - shared SQLite pending-login state across service instances
 - logout invalidating previously issued envelopes
-- normalized best-effort usage snapshots on status and login completion
+- normalized best-effort usage snapshots on status and login completion, including remaining-only premium snapshots from runtime usage sources
 - usage endpoint fallback and partial metric handling
+- explicit auto-search opt-in from the latest user message only
+- minimized provider queries and lower-trust server-side search reference injection before LiteLLM streaming
+- silent fallback to ordinary chat when the search provider fails
+- scrubbed server logs for search and streaming failures plus auto-search SSE passthrough/error fallback coverage
 - sanitized `code`/`message` error responses for status/login/chat/SSE paths
 - automatic envelope refresh during chat requests
 - SSE error contract when LiteLLM streaming fails at startup or emits an error-like mid-stream chunk
@@ -252,8 +285,8 @@ These variables are not part of the usual `.env` setup for the web app. The brow
 - Pending GitHub device-login state is stored server-side in SQLite, with WAL enabled, so multiple service processes on the same host can coordinate login polling safely.
 - Completed login results are temporarily replayable so a lost success response or duplicate poll can still receive the same credential envelope.
 - The browser only stores the encrypted envelope, never the raw Copilot token in plain text.
-- Usage is fetched server-side with the authenticated GitHub session and returned only as normalized remaining counts plus stable `reason/detail/source` metadata; the browser never receives raw tokens, upstream URLs, or exception text.
+- Usage is fetched server-side with the authenticated GitHub session and returned as normalized quota metadata plus stable `reason/detail/source` fields; the browser never receives raw tokens, upstream URLs, or exception text.
 - Copilot request headers are built locally in `services/copilot_headers.py`; the app does not depend on LiteLLM internal helper modules for this.
 - The UI includes a model picker, multiple local chat sessions, markdown-like rendering, code-block copy buttons, and a stop button for in-flight streaming.
-- The usage endpoints are not a documented public contract. The app currently tries `copilot_internal/v2/usage` first and falls back to `copilot_internal/user`, then normalizes recognized remaining-count fields. If GitHub changes those responses, the API and UI degrade to `partial` or `unavailable` instead of guessing values.
+- The usage endpoints are not a documented public contract. The app currently tries `copilot_internal/v2/usage` first and falls back to `copilot_internal/user`, then normalizes recognized quota fields such as `remaining`, `used`, `total`, and `plan` when present. If GitHub changes those responses, the API and UI degrade to `partial` or `unavailable` instead of guessing premium percentages from hardcoded totals.
 - A successful browser login and a successful usage display are separate concerns. The app treats usage as best-effort metadata and does not report every usage failure as an authentication failure.
