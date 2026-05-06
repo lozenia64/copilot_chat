@@ -453,6 +453,18 @@ select {
     padding: 0;
 }
 
+.auth-status-button .copilot-icon-connected {
+    display: none;
+}
+
+.auth-status-button.connected .copilot-icon-default {
+    display: none;
+}
+
+.auth-status-button.connected .copilot-icon-connected {
+    display: block;
+}
+
 .auth-status-button.connected {
     border-color: #b6d4fb;
     background: #eef5ff;
