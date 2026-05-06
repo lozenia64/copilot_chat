@@ -444,42 +444,25 @@ select {
 
 .auth-status-button {
     position: relative;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
     width: 46px;
     height: 46px;
     min-width: 46px;
     padding: 0;
-    justify-content: center;
-}
-
-.status-dot {
-    position: absolute;
-    right: 11px;
-    bottom: 10px;
-    width: 8px;
-    height: 8px;
-    border: 2px solid #ffffff;
-    border-radius: 999px;
-    background: #c7cdd6;
 }
 
 .auth-status-button.connected {
-    border-color: #cfe6d8;
-    background: #f5fbf7;
-    color: var(--success);
-}
-
-.auth-status-button.connected .status-dot {
-    background: var(--success);
+    border-color: #b6d4fb;
+    background: #eef5ff;
+    color: #0969da;
 }
 
 .auth-status-button.pending {
     border-color: #ecdcb6;
     background: #fffaf0;
     color: var(--pending);
-}
-
-.auth-status-button.pending .status-dot {
-    background: var(--pending);
 }
 
 .model-picker {
@@ -1284,14 +1267,14 @@ select {
 
     .app-shell {
         gap: 0;
-        padding: 12px;
+        padding: 8px;
     }
 
     .sidebar {
         position: fixed;
-        top: 12px;
-        bottom: 12px;
-        left: 12px;
+        top: 8px;
+        bottom: 8px;
+        left: 8px;
         width: min(82vw, 286px);
         min-width: auto;
         background: #ffffff;
@@ -1303,7 +1286,7 @@ select {
     }
 
     .main-panel {
-        gap: 10px;
+        gap: 8px;
     }
 
     .topbar,
@@ -1312,15 +1295,16 @@ select {
     .composer-inner,
     .empty-state,
     .auth-modal-card {
-        border-radius: 22px;
+        border-radius: 18px;
     }
 
     .topbar {
-        padding: 10px 12px;
+        padding: 7px 10px;
     }
 
+    /* 모바일에서 브랜드 텍스트 숨김 — 모델 선택기 공간 확보 */
     .topbar-copy {
-        gap: 8px;
+        display: none;
     }
 
     .topbar-actions {
@@ -1336,90 +1320,171 @@ select {
         font-size: 1rem;
     }
 
-    .usage-summary-copy-text {
+    .auth-status-button {
+        width: 40px;
+        height: 40px;
+        min-width: 40px;
+    }
+
+    /* 모바일 모델 선택기 — 긴 모델명 대응 */
+    .model-picker {
+        height: 40px;
+        padding: 0 10px;
         gap: 6px;
     }
 
-    .usage-summary-kicker {
+    .model-picker-icon {
         display: none;
     }
 
+    .model-picker select {
+        min-width: 72px;
+        max-width: 130px;
+        font-size: 0.9rem;
+    }
+
     .message-list {
-        padding: 14px;
+        padding: 12px;
     }
 
+    /* ── 컴팩트 Usage 스트립: 항상 한 줄로 표시 ── */
     .usage-summary {
-        align-items: flex-start;
-        flex-wrap: wrap;
+        flex-wrap: nowrap;
+        align-items: center;
         gap: 8px;
-        padding: 10px 12px;
+        padding: 6px 10px;
     }
 
-    .usage-summary-toggle {
-        display: inline-flex;
-        margin-left: auto;
+    .usage-summary-copy {
+        flex: 0 0 auto;
+        display: flex;
+        align-items: center;
+        gap: 6px;
     }
 
-    .usage-summary[data-collapsed="true"] .usage-summary-panel {
-        max-height: 0;
+    .usage-summary-icon {
+        width: 26px;
+        height: 26px;
+        border-radius: 8px;
+    }
+
+    .usage-summary-title {
+        font-size: 0.8rem;
+        white-space: nowrap;
+    }
+
+    /* 패널을 헤더 옆에 인라인으로 배치, 접힘 애니메이션 비활성 */
+    .usage-summary-panel {
+        display: flex;
+        flex: 1;
+        flex-direction: row;
+        align-items: center;
+        width: auto;
+        gap: 6px;
+        order: 0;
+        overflow: visible;
+        max-height: none;
+        opacity: 1;
+        transform: none;
+        pointer-events: auto;
+        transition: none;
+    }
+
+    /* 접힘 상태에서도 패널 표시 유지 */
+    .usage-summary[data-collapsed="true"] .usage-summary-panel,
+    .usage-summary[data-collapsed="false"] .usage-summary-panel {
+        max-height: none;
+        opacity: 1;
+        transform: none;
+        pointer-events: auto;
     }
 
     .usage-summary-grid {
-        justify-content: flex-start;
+        display: flex;
+        flex: 1;
+        flex-direction: row;
+        flex-wrap: nowrap;
+        gap: 6px;
+        justify-content: flex-end;
     }
 
+    /* 카드를 가로 레이아웃으로 전환 */
     .usage-card {
-        min-width: 138px;
-        padding: 8px 10px;
+        flex-direction: row;
+        align-items: center;
+        justify-content: space-between;
+        flex: 1;
+        gap: 6px;
+        min-width: 0;
+        max-width: 50%;
+        padding: 5px 8px;
+        border-radius: 10px;
     }
 
+    .usage-label {
+        font-size: 0.64rem;
+        white-space: nowrap;
+    }
+
+    .usage-value {
+        font-size: 0.72rem;
+        padding: 3px 7px;
+        white-space: nowrap;
+    }
+
+    /* 컴팩트 뷰에서 차트·메타·상세 텍스트·토글 숨김 */
     .usage-chart {
-        width: 112px;
+        display: none;
     }
 
-    .usage-summary-panel {
-        width: 100%;
-        align-items: flex-start;
-        flex-direction: column;
-        gap: 8px;
-        order: 3;
+    .usage-meta {
+        display: none;
     }
 
     .usage-summary-detail {
-        max-width: none;
-        text-align: left;
+        display: none;
+    }
+
+    .usage-summary-toggle {
+        display: none !important;
     }
 
     .empty-state {
-        padding: 14px 16px;
+        padding: 10px 12px;
+        gap: 5px;
     }
 
     .empty-state h3 {
-        max-width: 12ch;
-        font-size: clamp(1.35rem, 6vw, 1.9rem);
+        max-width: 16ch;
+        font-size: clamp(1.15rem, 5vw, 1.6rem);
+    }
+
+    .empty-state p {
+        font-size: 0.88rem;
+        line-height: 1.5;
     }
 
     .composer-inner {
-        padding: 12px 14px;
+        padding: 10px 12px;
     }
 
     .composer-meta {
-        margin-top: 6px;
+        margin-top: 5px;
     }
 
     .stream-status {
-        font-size: 0.86rem;
+        font-size: 0.82rem;
     }
 
     .send-button {
-        min-width: 78px;
+        min-width: 68px;
     }
 
     .toast-container {
-        left: 12px;
-        right: 12px;
+        left: 8px;
+        right: 8px;
         top: auto;
-        bottom: 12px;
+        bottom: 8px;
     }
 
     .toast {
@@ -1439,6 +1504,135 @@ select {
     .auth-modal-actions .primary-button {
         width: 100%;
         justify-content: center;
+    }
+}
+
+@media (max-width: 480px) {
+    .app-shell {
+        padding: 6px;
+    }
+
+    .sidebar {
+        top: 6px;
+        bottom: 6px;
+        left: 6px;
+    }
+
+    .main-panel {
+        gap: 6px;
+    }
+
+    .topbar,
+    .usage-summary,
+    .message-list,
+    .composer-inner {
+        border-radius: 14px;
+    }
+
+    .topbar {
+        padding: 6px 8px;
+    }
+
+    .brand-mark {
+        width: 30px;
+        height: 30px;
+        border-radius: 10px;
+    }
+
+    .auth-status-button {
+        width: 36px;
+        height: 36px;
+        min-width: 36px;
+    }
+
+    .model-picker {
+        height: 36px;
+        padding: 0 8px;
+        gap: 4px;
+        border-radius: 12px;
+    }
+
+    .model-picker select {
+        min-width: 56px;
+        max-width: 108px;
+        font-size: 0.84rem;
+    }
+
+    .usage-summary {
+        padding: 5px 8px;
+        gap: 6px;
+    }
+
+    .usage-summary-title {
+        font-size: 0.76rem;
+    }
+
+    .usage-summary-icon {
+        width: 24px;
+        height: 24px;
+        border-radius: 7px;
+    }
+
+    .usage-card {
+        min-width: 0;
+        padding: 4px 7px;
+        gap: 4px;
+        border-radius: 9px;
+    }
+
+    .usage-value {
+        font-size: 0.7rem;
+        padding: 3px 6px;
+    }
+
+    .usage-label {
+        font-size: 0.6rem;
+    }
+
+    .message-list {
+        padding: 10px;
+        border-radius: 14px;
+    }
+
+    .empty-state {
+        padding: 8px 10px;
+        gap: 4px;
+        border-radius: 14px;
+    }
+
+    .empty-state h3 {
+        font-size: clamp(1rem, 4.5vw, 1.3rem);
+    }
+
+    .empty-state p {
+        font-size: 0.84rem;
+        line-height: 1.45;
+    }
+
+    .composer-inner {
+        padding: 8px 10px;
+        gap: 8px;
+        border-radius: 14px;
+    }
+
+    .send-button {
+        min-width: 60px;
+        padding: 10px 12px;
+        border-radius: 14px;
+    }
+
+    .stream-status {
+        font-size: 0.78rem;
+    }
+
+    .composer-meta {
+        margin-top: 4px;
+    }
+
+    .toast-container {
+        left: 6px;
+        right: 6px;
+        bottom: 6px;
     }
 }
 

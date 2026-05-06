@@ -1,10 +1,5 @@
 const DEFAULT_MODEL = window.APP_CONFIG?.defaultModel ?? "gpt-5.4";
 const CREDENTIAL_STORAGE_KEY = window.APP_CONFIG?.credentialStorageKey ?? "copilotCredentialEnvelope";
-const QUICK_PROMPTS = [
-    "이 저장소 구조를 빠르게 설명해줘.",
-    "LiteLLM과 Copilot 인증 흐름을 점검해줘.",
-    "현재 테스트 파일 기준으로 검증 포인트를 정리해줘.",
-];
 const SERVER_ERROR_MESSAGES = Object.freeze({
     conversation_message_required: "보낼 메시지를 입력하세요.",
     conversation_not_found: "대화 세션을 찾을 수 없습니다. 새 대화를 시작하세요.",
@@ -459,42 +454,11 @@ function renderSidebar() {
     elements.sessionList.appendChild(fragment);
 }
 
-function renderEmptyState() {
-    const wrapper = document.createElement("div");
-    wrapper.className = "empty-state";
-
-    const kicker = document.createElement("span");
-    kicker.className = "empty-state-kicker";
-    kicker.textContent = "Ready to Brief";
-
-    const title = document.createElement("h3");
-    title.textContent = "무엇을 만들지 한 문장으로 던져보세요.";
-
-    const description = document.createElement("p");
-    description.textContent = "GitHub Copilot 인증 상태를 확인한 뒤, 현재 브라우저 세션에 연결된 자격으로 LiteLLM 응답을 이 화면에서 바로 스트리밍합니다.";
-
-    const quickPrompts = document.createElement("div");
-    quickPrompts.className = "quick-prompts";
-
-    QUICK_PROMPTS.forEach((promptText) => {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.className = "quick-prompt";
-        button.textContent = promptText;
-        button.addEventListener("click", () => setPromptValue(promptText));
-        quickPrompts.appendChild(button);
-    });
-
-    wrapper.append(kicker, title, description, quickPrompts);
-    return wrapper;
-}
-
 function renderMessages() {
     elements.messages.innerHTML = "";
     const session = getActiveSession();
 
     if (!session || session.messages.length === 0) {
-        elements.messages.appendChild(renderEmptyState());
         return;
     }
 
