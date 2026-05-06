@@ -684,7 +684,7 @@ class ConversationService:
         return None
 
     def _is_stream_error_payload(self, payload: dict[str, Any]) -> bool:
-        return payload.get("code") == "copilot_chat_stream_failed"
+        return payload.get("code") in {"copilot_chat_stream_failed", "copilot_rate_limit_exceeded"}
 
     def _extract_stream_text(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices")
@@ -708,6 +708,10 @@ class ConversationService:
         reasoning_content = delta.get("reasoning_content")
         if isinstance(reasoning_content, str) and reasoning_content:
             return reasoning_content
+
+        tool_calls = delta.get("tool_calls")
+        if tool_calls:
+            return json.dumps(tool_calls, ensure_ascii=False)
 
         return ""
 

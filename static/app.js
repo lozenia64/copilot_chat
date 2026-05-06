@@ -19,6 +19,7 @@ const SERVER_ERROR_MESSAGES = Object.freeze({
     copilot_api_token_missing: "GitHub Copilot 토큰 응답에 token 이 없습니다.",
     copilot_api_token_unreachable: "GitHub Copilot 토큰을 가져오지 못했습니다. 잠시 후 다시 시도하세요.",
     copilot_chat_stream_failed: "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요.",
+    copilot_rate_limit_exceeded: "주간 사용량 한도를 초과하여 채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요.",
     copilot_credential_binding_mismatch: "저장된 GitHub Copilot 자격 정보가 현재 브라우저 세션과 맞지 않습니다. 다시 로그인하세요.",
     copilot_credential_invalid: "저장된 GitHub Copilot 자격 정보를 복호화할 수 없습니다. 다시 로그인하세요.",
     copilot_device_flow_invalid_response: "GitHub 로그인 응답에 필요한 코드 정보가 없습니다.",

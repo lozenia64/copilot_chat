@@ -70,7 +70,9 @@ class ChatRequest(BaseModel):
     model: str | None = None
     messages: list[dict[str, Any]]
     credentialEnvelope: str | None = None
-    searchMode: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
 
 
 class ConversationCreateRequest(BaseModel):
@@ -85,7 +87,9 @@ class ConversationMessageRequest(BaseModel):
     content: str
     model: str | None = None
     credentialEnvelope: str | None = None
-    searchMode: str | None = None
+    tools: list[dict[str, Any]] | None = None
+    tool_choice: Any = None
+    parallel_tool_calls: bool | None = None
 
 
 def _resolve_browser_session_context(request: Request) -> BrowserSessionContext:
@@ -233,7 +237,6 @@ async def send_conversation_message(
 
     content = conversation_service.validate_message_content(payload.content)
     model_id = chat_service.resolve_model(payload.model) if payload.model is not None else None
-    search_mode = chat_service.normalize_search_mode(payload.searchMode)
 
     browser_session = _resolve_browser_session_context(request)
     copilot_session, refreshed_envelope = await auth_service.resolve_session(
@@ -246,10 +249,6 @@ async def send_conversation_message(
         content=content,
         model=model_id,
     )
-    prepared_messages = await chat_service.prepare_messages_for_completion(
-        turn.visible_messages,
-        search_mode=search_mode,
-    )
 
     stream_response = _build_streaming_response(
         conversation_service.persist_stream(
@@ -260,9 +259,12 @@ async def send_conversation_message(
             stream=chat_service.stream_chat_completion(
                 request=request,
                 model=turn.model,
-                messages=prepared_messages,
+                messages=turn.visible_messages,
                 session=copilot_session,
                 initiator_messages=turn.visible_messages,
+                tools=payload.tools,
+                tool_choice=payload.tool_choice,
+                parallel_tool_calls=payload.parallel_tool_calls,
             ),
         )
     )
@@ -320,25 +322,23 @@ async def chat(request: Request, payload: ChatRequest):
         )
 
     model, messages = chat_service.validate_chat_request(payload.model, payload.messages)
-    search_mode = chat_service.normalize_search_mode(payload.searchMode)
 
     browser_session = _resolve_browser_session_context(request)
     copilot_session, refreshed_envelope = await auth_service.resolve_session(
         payload.credentialEnvelope,
         browser_session.session_secret,
     )
-    prepared_messages = await chat_service.prepare_messages_for_completion(
-        messages,
-        search_mode=search_mode,
-    )
 
     stream_response = _build_streaming_response(
         chat_service.stream_chat_completion(
             request=request,
             model=model,
-            messages=prepared_messages,
+            messages=messages,
             session=copilot_session,
             initiator_messages=messages,
+            tools=payload.tools,
+            tool_choice=payload.tool_choice,
+            parallel_tool_calls=payload.parallel_tool_calls,
         )
     )
     _apply_browser_session_cookie(stream_response, browser_session)

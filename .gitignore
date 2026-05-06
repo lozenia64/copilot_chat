@@ -10,11 +10,12 @@ __pycache__/
 .coverage.*
 htmlcov/
 
-.copilot_pending_login.sqlite3
-.copilot_pending_login.sqlite3-wal
-.copilot_pending_login.sqlite3-shm
+.copilot_*.sqlite3
 
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
+
+.oracleCloud/
+scratch.py
