@@ -1,5 +1,6 @@
 :root {
     color-scheme: light;
+    --app-height: 100dvh;
     --bg: #ffffff;
     --bg-soft: #fafafa;
     --panel: #ffffff;
@@ -20,6 +21,7 @@
     --radius-md: 18px;
     --radius-sm: 14px;
     --content-max-width: 1140px;
+    --safe-area-bottom: env(safe-area-inset-bottom, 0px);
     --font-display: "Space Grotesk", "IBM Plex Sans KR", "Segoe UI", sans-serif;
     --font-body: "IBM Plex Sans KR", "Segoe UI", sans-serif;
 }
@@ -48,7 +50,8 @@ html,
 body {
     margin: 0;
     width: 100%;
-    height: 100%;
+    min-height: 100%;
+    height: var(--app-height);
     overflow: hidden;
     background: var(--bg);
     color: var(--text);
@@ -137,8 +140,9 @@ select {
     display: flex;
     gap: 16px;
     width: 100vw;
-    height: 100vh;
-    padding: 16px;
+    height: var(--app-height);
+    min-height: var(--app-height);
+    padding: 16px 16px calc(16px + var(--safe-area-bottom)) 16px;
     background: var(--bg);
 }
 
@@ -516,6 +520,7 @@ select {
     min-height: 0;
     overflow-y: auto;
     padding: 10px 12px;
+    scroll-padding-bottom: 32px;
     border: 1px solid var(--border);
     border-radius: var(--radius-xl);
     background: var(--panel);
@@ -1279,13 +1284,13 @@ select {
 
     .app-shell {
         gap: 0;
-        padding: 8px;
+        padding: 8px 8px calc(14px + var(--safe-area-bottom)) 8px;
     }
 
     .sidebar {
         position: fixed;
         top: 8px;
-        bottom: 8px;
+        bottom: calc(8px + var(--safe-area-bottom));
         left: 8px;
         width: min(82vw, 286px);
         min-width: auto;
@@ -1496,7 +1501,7 @@ select {
         left: 8px;
         right: 8px;
         top: auto;
-        bottom: 8px;
+        bottom: calc(8px + var(--safe-area-bottom));
     }
 
     .toast {
@@ -1521,12 +1526,12 @@ select {
 
 @media (max-width: 480px) {
     .app-shell {
-        padding: 6px;
+        padding: 6px 6px calc(12px + var(--safe-area-bottom)) 6px;
     }
 
     .sidebar {
         top: 6px;
-        bottom: 6px;
+        bottom: calc(6px + var(--safe-area-bottom));
         left: 6px;
     }
 
@@ -1644,7 +1649,7 @@ select {
     .toast-container {
         left: 6px;
         right: 6px;
-        bottom: 6px;
+        bottom: calc(6px + var(--safe-area-bottom));
     }
 }
 

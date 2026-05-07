@@ -705,9 +705,20 @@ function syncComposerStatus() {
     setComposerStatus(COMPOSER_READY_MESSAGE, "ready");
 }
 
+function syncViewportHeightVar() {
+    const viewportHeight = Math.max(
+        Math.round(window.visualViewport?.height ?? window.innerHeight),
+        1,
+    );
+    document.documentElement.style.setProperty("--app-height", `${viewportHeight}px`);
+}
+
 function getViewportLayout() {
-    const width = window.innerWidth;
-    const height = Math.max(window.innerHeight, 1);
+    const width = Math.round(window.visualViewport?.width ?? window.innerWidth);
+    const height = Math.max(
+        Math.round(window.visualViewport?.height ?? window.innerHeight),
+        1,
+    );
     const usesOverlaySidebar = width <= MOBILE_VIEWPORT_MAX_WIDTH;
 
     return {
@@ -2085,6 +2096,8 @@ function bindEvents() {
     });
 
     window.addEventListener("resize", syncResponsiveLayout);
+    window.visualViewport?.addEventListener("resize", syncViewportHeightVar);
+    window.visualViewport?.addEventListener("scroll", syncViewportHeightVar);
 
     window.addEventListener("beforeunload", () => {
         clearComposerStatusTimer();
@@ -2096,6 +2109,7 @@ function bindEvents() {
 
 async function init() {
     bindEvents();
+    syncViewportHeightVar();
     adjustTextareaHeight();
     updateComposerControls();
     syncComposerStatus();
