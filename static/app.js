@@ -532,6 +532,13 @@ function updateMessageContent(message) {
     scrollMessagesToBottom();
 }
 
+function applyAssistantFailureMessage(session, assistantMessage, message) {
+    assistantMessage.content = message || "응답을 가져오지 못했습니다.";
+    assistantMessage.status = "error";
+    session.updatedAt = Date.now();
+    updateMessageContent(assistantMessage);
+}
+
 function getSessionIdByMessage(messageId) {
     const session = state.sessions.find((item) => item.messages.some((message) => message.id === messageId));
     return session?.id ?? null;
@@ -1890,6 +1897,7 @@ async function sendPrompt() {
     let shouldRefreshUsage = false;
     let shouldResyncConversation = false;
     let didPersistTurn = false;
+    let didReceiveResponse = false;
     const searchMode = resolveSearchModeForPrompt(content);
 
     try {
@@ -1906,6 +1914,7 @@ async function sendPrompt() {
             }),
             signal: state.abortController.signal,
         });
+        didReceiveResponse = true;
 
         updateCredentialEnvelopeFromResponse(response);
         if (!response.ok) {
@@ -1936,18 +1945,17 @@ async function sendPrompt() {
             setComposerStatus(COMPOSER_ABORTED_MESSAGE, "stopped", { persistMs: COMPOSER_STATUS_HOLD_MS });
             showToast("응답 생성을 중단했습니다.", "info");
         } else {
-            shouldResyncConversation = true;
-            if (!didPersistTurn) {
-                session.messages = session.messages.filter(
-                    (message) => message.id !== userMessage.id && message.id !== assistantMessage.id,
+            shouldResyncConversation = didPersistTurn || !didReceiveResponse;
+            if (!assistantMessage.content) {
+                applyAssistantFailureMessage(
+                    session,
+                    assistantMessage,
+                    error.message || "응답을 가져오지 못했습니다.",
                 );
-            } else if (!assistantMessage.content) {
-                session.messages = session.messages.filter((message) => message.id !== assistantMessage.id);
             }
             if (state.copilot.status !== "connected") {
                 resetUsageSnapshot("not_authenticated");
             }
-            showToast(error.message || "응답을 가져오지 못했습니다.", "error");
         }
     } finally {
         if (!assistantMessage.content) {

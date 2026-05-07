@@ -685,6 +685,7 @@ class ConversationService:
     ) -> AsyncIterator[bytes]:
         assistant_content = ""
         saw_stream_error = False
+        stream_error_message = ""
 
         try:
             async for chunk in stream:
@@ -706,11 +707,14 @@ class ConversationService:
                         )
                     elif self._is_stream_error_payload(payload):
                         saw_stream_error = True
+                        if not assistant_content:
+                            stream_error_message = self._extract_stream_error_message(payload)
 
                 yield chunk
         finally:
             is_disconnected = await request.is_disconnected()
-            if not assistant_content:
+            final_content = assistant_content or stream_error_message
+            if not final_content:
                 self._repository.delete_message(scope_id, conversation_id, assistant_message_id)
                 return
 
@@ -724,7 +728,7 @@ class ConversationService:
                 scope_id,
                 conversation_id,
                 assistant_message_id,
-                content=assistant_content,
+                content=final_content,
                 state=final_state,
             )
 
@@ -756,6 +760,17 @@ class ConversationService:
             "copilot_model_not_supported",
             "copilot_rate_limit_exceeded",
         }
+
+    def _extract_stream_error_message(self, payload: dict[str, Any]) -> str:
+        message = payload.get("message")
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+
+        detail = payload.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+
+        return ""
 
     def _extract_stream_text(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices")
