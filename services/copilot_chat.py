@@ -31,7 +31,7 @@ class CopilotChatService:
     ) -> None:
         self.config_path = config_path
         self.default_model = default_model
-        self.model_ids = self._load_model_ids()
+        self.model_ids, self.litellm_model_by_id = self._load_model_config()
         self.allowed_model_ids = set(self.model_ids)
         self.stream_timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0)
 
@@ -51,6 +51,9 @@ class CopilotChatService:
                 message="선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
             )
         return model_id
+
+    def resolve_litellm_model(self, model: str) -> str:
+        return self.litellm_model_by_id.get(model, model)
 
     def validate_chat_request(
         self,
@@ -107,9 +110,10 @@ class CopilotChatService:
     ) -> AsyncIterator[bytes]:
         extra_headers = self._build_extra_headers(initiator_messages or messages)
         stream = None
+        provider_model = self.resolve_litellm_model(model)
 
         kwargs: dict[str, Any] = {
-            "model": model,
+            "model": provider_model,
             "messages": messages,
             "stream": True,
             "api_key": session.copilot_api_token,
@@ -333,22 +337,23 @@ class CopilotChatService:
             "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요.",
         }
 
-    def _load_model_ids(self) -> list[str]:
+    def _load_model_config(self) -> tuple[list[str], dict[str, str]]:
         if not self.config_path.exists():
-            return [self.default_model]
+            return [self.default_model], {self.default_model: self.default_model}
 
         try:
             config = yaml.safe_load(self.config_path.read_text(encoding="utf-8")) or {}
         except (OSError, yaml.YAMLError) as exc:
             LOGGER.warning("Failed to read model config %s: %s", self.config_path, exc)
-            return [self.default_model]
+            return [self.default_model], {self.default_model: self.default_model}
 
         raw_models = config.get("model_list")
         if not isinstance(raw_models, list):
-            return [self.default_model]
+            return [self.default_model], {self.default_model: self.default_model}
 
         seen: set[str] = set()
         model_ids: list[str] = []
+        litellm_model_by_id: dict[str, str] = {}
         for item in raw_models:
             if not isinstance(item, dict):
                 continue
@@ -358,12 +363,20 @@ class CopilotChatService:
             model_id = model_name.strip()
             if not model_id or model_id in seen:
                 continue
+            provider_model = model_id
+            litellm_params = item.get("litellm_params")
+            if isinstance(litellm_params, dict):
+                configured_model = litellm_params.get("model")
+                if isinstance(configured_model, str) and configured_model.strip():
+                    provider_model = configured_model.strip()
             seen.add(model_id)
             model_ids.append(model_id)
+            litellm_model_by_id[model_id] = provider_model
 
         if not model_ids:
-            return [self.default_model]
+            return [self.default_model], {self.default_model: self.default_model}
 
         if self.default_model not in seen:
             model_ids.insert(0, self.default_model)
-        return model_ids
+            litellm_model_by_id[self.default_model] = self.default_model
+        return model_ids, litellm_model_by_id
