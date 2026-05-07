@@ -27,6 +27,7 @@ DEFAULT_GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98"
 DEFAULT_GITHUB_DEVICE_CODE_URL = "https://github.com/login/device/code"
 DEFAULT_GITHUB_ACCESS_TOKEN_URL = "https://github.com/login/oauth/access_token"
 DEFAULT_GITHUB_API_KEY_URL = "https://api.github.com/copilot_internal/v2/token"
+DEFAULT_GITHUB_USER_URL = "https://api.github.com/user"
 DEFAULT_GITHUB_USAGE_URLS = (
     "https://api.github.com/copilot_internal/v2/usage",
     "https://api.github.com/copilot_internal/user",
@@ -80,6 +81,16 @@ class CopilotCredentialSession:
     issued_at: float
     updated_at: float
     credential_id: str
+    github_user_id: str | None = None
+    github_login: str | None = None
+
+
+@dataclass(slots=True)
+class HistoryOwnerContext:
+    scope_id: str
+    authenticated: bool
+    github_user_id: str | None = None
+    github_login: str | None = None
 
 
 @dataclass(slots=True)
@@ -457,6 +468,10 @@ class CopilotAuthService:
             "GITHUB_COPILOT_API_KEY_URL",
             DEFAULT_GITHUB_API_KEY_URL,
         )
+        self.github_user_url = os.getenv(
+            "GITHUB_COPILOT_USER_URL",
+            DEFAULT_GITHUB_USER_URL,
+        )
         configured_usage_urls = os.getenv("GITHUB_COPILOT_USAGE_URLS", "")
         self.github_usage_urls = tuple(
             url.strip()
@@ -539,6 +554,29 @@ class CopilotAuthService:
         ).digest()
         return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
 
+    def get_anonymous_history_scope(self, browser_scope_id: str) -> str:
+        return browser_scope_id
+
+    def get_user_history_scope(self, github_user_id: str) -> str:
+        return f"user:{github_user_id}"
+
+    def get_authenticated_history_owner(
+        self,
+        session: CopilotCredentialSession,
+    ) -> HistoryOwnerContext:
+        if not session.github_user_id:
+            raise CopilotAuthError(
+                status_code=503,
+                message="GitHub 계정 정보를 확인하지 못했습니다. 다시 로그인하세요.",
+                code="copilot_account_invalid",
+            )
+        return HistoryOwnerContext(
+            scope_id=self.get_user_history_scope(session.github_user_id),
+            authenticated=True,
+            github_user_id=session.github_user_id,
+            github_login=session.github_login,
+        )
+
     def inspect_envelope(self, envelope: str | None, session_secret: str) -> dict[str, Any]:
         if not envelope:
             return self._unauthenticated_status_payload()
@@ -558,13 +596,17 @@ class CopilotAuthService:
 
         return self._authenticated_status_payload(session)
 
-    async def get_status_payload(self, envelope: str | None, session_secret: str) -> dict[str, Any]:
+    async def get_status_payload(
+        self,
+        envelope: str | None,
+        session_secret: str,
+    ) -> tuple[dict[str, Any], str | None]:
         payload = self.inspect_envelope(envelope, session_secret)
         if not payload.get("authenticated"):
-            return payload
+            return payload, None
 
         try:
-            session = self._decrypt_envelope(str(envelope), session_secret)
+            session, refreshed_envelope = await self.resolve_session(str(envelope), session_secret)
         except CopilotAuthError as exc:
             fallback = self._unauthenticated_status_payload()
             fallback.update(
@@ -574,10 +616,38 @@ class CopilotAuthService:
                     "shouldClearEnvelope": True,
                 }
             )
-            return fallback
+            return fallback, None
 
         payload["usage"] = await self.fetch_usage_snapshot(session.github_access_token)
-        return payload
+        return payload, refreshed_envelope
+
+    async def resolve_history_scope(
+        self,
+        envelope: str | None,
+        session_secret: str,
+        browser_scope_id: str,
+    ) -> tuple[HistoryOwnerContext, str | None]:
+        anonymous_scope = self.get_anonymous_history_scope(browser_scope_id)
+        if not envelope:
+            return HistoryOwnerContext(scope_id=anonymous_scope, authenticated=False), None
+
+        try:
+            session, refreshed_envelope = await self.resolve_session(envelope, session_secret)
+        except CopilotAuthError:
+            return HistoryOwnerContext(scope_id=anonymous_scope, authenticated=False), None
+
+        if not session.github_user_id:
+            return HistoryOwnerContext(scope_id=anonymous_scope, authenticated=False), refreshed_envelope
+
+        return (
+            HistoryOwnerContext(
+                scope_id=self.get_user_history_scope(session.github_user_id),
+                authenticated=True,
+                github_user_id=session.github_user_id,
+                github_login=session.github_login,
+            ),
+            refreshed_envelope,
+        )
 
     async def start_login(self, session_secret: str) -> dict[str, Any]:
         self._pending_login_store.purge_expired(time.time())
@@ -744,13 +814,37 @@ class CopilotAuthService:
         session_secret: str,
     ) -> tuple[CopilotCredentialSession, str | None]:
         session = self._decrypt_envelope(envelope, session_secret)
-        if not self._needs_refresh(session):
-            return session, None
+        refreshed_envelope: str | None = None
+        if self._needs_refresh(session):
+            refreshed_session = await self._build_credential_session(session.github_access_token)
+            refreshed_session.issued_at = session.issued_at
+            session = refreshed_session
+            refreshed_envelope = self._encrypt_session(session, session_secret)
+        elif not session.github_user_id or not session.github_login:
+            session = await self._with_github_user_identity(session)
+            refreshed_envelope = self._encrypt_session(session, session_secret)
 
-        refreshed_session = await self._build_credential_session(session.github_access_token)
-        refreshed_session.issued_at = session.issued_at
-        envelope_value = self._encrypt_session(refreshed_session, session_secret)
-        return refreshed_session, envelope_value
+        return session, refreshed_envelope
+
+    async def _with_github_user_identity(
+        self,
+        session: CopilotCredentialSession,
+    ) -> CopilotCredentialSession:
+        if session.github_user_id and session.github_login:
+            return session
+
+        github_user_id, github_login = await self._request_github_user_profile(session.github_access_token)
+        return CopilotCredentialSession(
+            github_access_token=session.github_access_token,
+            copilot_api_token=session.copilot_api_token,
+            copilot_api_expires_at=session.copilot_api_expires_at,
+            copilot_api_base=session.copilot_api_base,
+            issued_at=session.issued_at,
+            updated_at=time.time(),
+            credential_id=session.credential_id,
+            github_user_id=github_user_id,
+            github_login=github_login,
+        )
 
     async def _request_device_code(self) -> dict[str, Any]:
         payload = {
@@ -862,6 +956,7 @@ class CopilotAuthService:
                 code="copilot_api_token_invalid_expiry",
             ) from exc
 
+        github_user_id, github_login = await self._request_github_user_profile(access_token)
         now = time.time()
         return CopilotCredentialSession(
             github_access_token=access_token,
@@ -871,7 +966,35 @@ class CopilotAuthService:
             issued_at=now,
             updated_at=now,
             credential_id=self._credential_id(access_token),
+            github_user_id=github_user_id,
+            github_login=github_login,
         )
+
+    async def _request_github_user_profile(self, access_token: str) -> tuple[str, str]:
+        try:
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                response = await client.get(
+                    self.github_user_url,
+                    headers=self._github_headers(access_token),
+                )
+        except httpx.RequestError as exc:
+            LOGGER.warning("GitHub user profile fetch failed: %s", exc)
+            raise CopilotAuthError(
+                status_code=503,
+                message="GitHub 계정 정보를 확인하지 못했습니다. 잠시 후 다시 시도하세요.",
+                code="copilot_account_unreachable",
+            ) from exc
+
+        payload = self._json_payload(response, "GitHub 계정 정보를 확인하지 못했습니다.")
+        github_user_id = payload.get("id")
+        github_login = payload.get("login")
+        if github_user_id is None or not isinstance(github_login, str) or not github_login.strip():
+            raise CopilotAuthError(
+                status_code=502,
+                message="GitHub 계정 정보를 확인하지 못했습니다. 다시 로그인하세요.",
+                code="copilot_account_invalid",
+            )
+        return str(github_user_id), github_login.strip()
 
     async def fetch_usage_snapshot(self, access_token: str) -> dict[str, Any]:
         last_shape_source: str | None = None
@@ -1497,6 +1620,8 @@ class CopilotAuthService:
             "issued_at": session.issued_at,
             "updated_at": session.updated_at,
             "credential_id": session.credential_id,
+            "github_user_id": session.github_user_id,
+            "github_login": session.github_login,
         }
         serialized = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         return self._fernet.encrypt(serialized).decode("utf-8")
@@ -1536,6 +1661,8 @@ class CopilotAuthService:
                 issued_at=float(payload.get("issued_at", time.time())),
                 updated_at=float(payload.get("updated_at", time.time())),
                 credential_id=str(payload.get("credential_id") or self._credential_id(str(payload["github_access_token"]))),
+                github_user_id=self._normalize_text(payload.get("github_user_id")),
+                github_login=self._normalize_text(payload.get("github_login")),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise CopilotAuthError(
@@ -1554,6 +1681,13 @@ class CopilotAuthService:
             hashlib.sha256,
         ).digest()
         return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
+
+    @staticmethod
+    def _normalize_text(value: Any) -> str | None:
+        if not isinstance(value, str):
+            return None
+        normalized = value.strip()
+        return normalized or None
 
     @staticmethod
     def _debug_prefix(value: str, width: int = 8) -> str:
@@ -1671,6 +1805,8 @@ class CopilotAuthService:
             return "device_code"
         if upstream_url.endswith("/login/oauth/access_token"):
             return "device_access_token"
+        if upstream_url.endswith("/user"):
+            return "github_user_profile"
         if "/copilot_internal/v2/token" in upstream_url:
             return "copilot_token"
         if "/copilot_internal/" in upstream_url:

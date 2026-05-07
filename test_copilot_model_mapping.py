@@ -39,24 +39,35 @@ class FakeStream:
 
 class CopilotModelMappingTests(unittest.IsolatedAsyncioTestCase):
     async def test_stream_uses_litellm_provider_model_mapping(self) -> None:
-        service = CopilotChatService(
-            config_path=Path(__file__).resolve().parent / "litellm_config.yaml",
-            default_model="gpt-5.4",
-        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_path = Path(temp_dir) / "litellm_config.yaml"
+            config_path.write_text(
+                (
+                    "model_list:\n"
+                    "  - model_name: gpt-5.4\n"
+                    "    litellm_params:\n"
+                    "      model: github_copilot/gpt-5.4\n"
+                ),
+                encoding="utf-8",
+            )
+            service = CopilotChatService(
+                config_path=config_path,
+                default_model="gpt-5.4",
+            )
 
-        with patch(
-            "services.copilot_chat.litellm.acompletion",
-            AsyncMock(return_value=FakeStream()),
-        ) as acompletion:
-            chunks = [
-                chunk
-                async for chunk in service.stream_chat_completion(
-                    request=FakeRequest(),
-                    model="gpt-5.4",
-                    messages=[{"role": "user", "content": "hello"}],
-                    session=make_credential_session(),
-                )
-            ]
+            with patch(
+                "services.copilot_chat.litellm.acompletion",
+                AsyncMock(return_value=FakeStream()),
+            ) as acompletion:
+                chunks = [
+                    chunk
+                    async for chunk in service.stream_chat_completion(
+                        request=FakeRequest(),
+                        model="gpt-5.4",
+                        messages=[{"role": "user", "content": "hello"}],
+                        session=make_credential_session(),
+                    )
+                ]
 
         self.assertTrue(b"".join(chunks).decode("utf-8").rstrip().endswith("data: [DONE]"))
         self.assertEqual(acompletion.await_args.kwargs["model"], "github_copilot/gpt-5.4")
@@ -76,13 +87,13 @@ class CopilotModelMappingTests(unittest.IsolatedAsyncioTestCase):
                     {"id": "claude-haiku-4.5"},
                     {"id": "claude-sonnet-4.6"},
                     {"id": "claude-opus-4.7"},
-                    {"id": "gemini-3.1-pro-preview"},
+                    {"id": "gemini-3.1-pro"},
                 ]
             },
         )
         self.assertEqual(
-            service.resolve_litellm_model("gemini-3.1-pro-preview"),
-            "github_copilot/gemini-3.1-pro-preview",
+            service.resolve_litellm_model("gemini-3.1-pro"),
+            "gemini-3.1-pro-preview",
         )
 
     async def test_default_model_without_explicit_mapping_uses_own_id(self) -> None:

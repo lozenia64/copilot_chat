@@ -242,9 +242,21 @@ function applyConversationStatePayload(payload) {
     populateModelOptions();
 }
 
+function buildConversationScopePayload() {
+    return {
+        credentialEnvelope: state.copilot.envelope || null,
+    };
+}
+
 async function loadConversationState({ silent = false } = {}) {
     try {
-        const payload = await requestJson("/api/conversations");
+        const payload = await requestJson("/api/conversations/state", {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(buildConversationScopePayload()),
+        });
         applyConversationStatePayload(payload);
         return state.sessions;
     } catch (error) {
@@ -283,7 +295,10 @@ async function persistSessionModel(sessionId, modelId, previousModel) {
             headers: {
                 "Content-Type": "application/json",
             },
-            body: JSON.stringify({ model: modelId }),
+            body: JSON.stringify({
+                model: modelId,
+                ...buildConversationScopePayload(),
+            }),
         });
         replaceSession(payload?.session);
         renderSidebar();
@@ -374,6 +389,7 @@ async function createSession({ focus = true, silent = false } = {}) {
             },
             body: JSON.stringify({
                 model: resolveModelId(currentSession?.model || elements.modelSelect.value || DEFAULT_MODEL),
+                ...buildConversationScopePayload(),
             }),
         });
         const session = replaceSession(payload?.session);
@@ -404,6 +420,10 @@ async function selectSession(sessionId) {
     try {
         await requestJson(`/api/conversations/${encodeURIComponent(sessionId)}/activate`, {
             method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(buildConversationScopePayload()),
         });
     } catch (error) {
         showToast(error.message || "대화를 열지 못했습니다.", "error");
@@ -1694,6 +1714,7 @@ async function beginCopilotAuthorization() {
         persistCredentialEnvelope(pollPayload.credentialEnvelope || "");
         resetLoginFlowState();
         applyConnectedCopilotState(pollPayload);
+        await loadConversationState({ silent: true });
         showToast("GitHub Copilot 계정이 현재 브라우저에 연결되었습니다.", "info");
         return true;
     } catch (error) {
@@ -2056,8 +2077,8 @@ async function init() {
     syncResponsiveLayout();
     populateModelOptions();
     renderAuthState();
-    await loadConversationState({ silent: true });
     await refreshCopilotStatus();
+    await loadConversationState({ silent: true });
     await loadModels();
     state.sessions.forEach((session) => {
         session.model = resolveModelId(session.model);

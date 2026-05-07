@@ -18,6 +18,8 @@ from fastapi import Request
 DEFAULT_CHAT_HISTORY_DB_PATH = Path(__file__).resolve().parent.parent / ".copilot_chat_history.sqlite3"
 DEFAULT_CONVERSATION_TITLE = "새 대화"
 DEFAULT_ASSISTANT_STATE = "complete"
+DEFAULT_CHAT_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 7
+DEFAULT_CHAT_HISTORY_CLEANUP_INTERVAL_SECONDS = 60
 
 
 @dataclass(slots=True)
@@ -36,14 +38,24 @@ class ConversationStateError(Exception):
 
 
 class ChatHistoryRepository:
-    def __init__(self, db_path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        db_path: str | os.PathLike[str],
+        *,
+        ttl_seconds: int = DEFAULT_CHAT_HISTORY_TTL_SECONDS,
+        cleanup_interval_seconds: int = DEFAULT_CHAT_HISTORY_CLEANUP_INTERVAL_SECONDS,
+    ) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.ttl_seconds = max(int(ttl_seconds), 1)
+        self.cleanup_interval_seconds = max(int(cleanup_interval_seconds), 0)
+        self._last_cleanup_monotonic = 0.0
         self._initialize()
 
     def get_state_payload(self, scope_id: str) -> dict[str, Any]:
         current_time = time.time()
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
             self._ensure_scope(connection, scope_id, current_time)
             scope_row = connection.execute(
                 """
@@ -97,6 +109,7 @@ class ChatHistoryRepository:
         conversation_id = f"conv_{secrets.token_urlsafe(12)}"
 
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
             self._ensure_scope(connection, scope_id, current_time)
             connection.execute(
                 """
@@ -131,6 +144,7 @@ class ChatHistoryRepository:
 
     def get_conversation_payload(self, scope_id: str, conversation_id: str) -> dict[str, Any]:
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, time.time())
             conversation_row = self._require_conversation(connection, scope_id, conversation_id)
             messages = self._load_visible_messages(connection, [conversation_id]).get(conversation_id, [])
         return self._conversation_row_to_payload(conversation_row, messages)
@@ -138,6 +152,7 @@ class ChatHistoryRepository:
     def activate_conversation(self, scope_id: str, conversation_id: str) -> None:
         current_time = time.time()
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
             self._require_conversation(connection, scope_id, conversation_id)
             self._ensure_scope(connection, scope_id, current_time)
             connection.execute(
@@ -151,6 +166,7 @@ class ChatHistoryRepository:
 
     def update_conversation_model(self, scope_id: str, conversation_id: str, model: str) -> dict[str, Any]:
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, time.time())
             self._require_conversation(connection, scope_id, conversation_id)
             connection.execute(
                 """
@@ -175,6 +191,7 @@ class ChatHistoryRepository:
         assistant_message_id = f"msg_{secrets.token_urlsafe(12)}"
 
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
             conversation_row = self._require_conversation(connection, scope_id, conversation_id)
             connection.execute(
                 """
@@ -282,6 +299,7 @@ class ChatHistoryRepository:
     ) -> None:
         current_time = time.time()
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
             self._require_assistant_message(connection, scope_id, conversation_id, assistant_message_id)
             connection.execute(
                 """
@@ -324,6 +342,7 @@ class ChatHistoryRepository:
     def delete_message(self, scope_id: str, conversation_id: str, message_id: str) -> None:
         current_time = time.time()
         with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
             self._require_conversation(connection, scope_id, conversation_id)
             connection.execute(
                 """
@@ -394,6 +413,12 @@ class ChatHistoryRepository:
             )
             connection.execute(
                 """
+                CREATE INDEX IF NOT EXISTS idx_conversations_updated_at
+                ON conversations (updated_at)
+                """
+            )
+            connection.execute(
+                """
                 CREATE TABLE IF NOT EXISTS conversation_messages (
                     id TEXT PRIMARY KEY,
                     conversation_id TEXT NOT NULL,
@@ -432,6 +457,38 @@ class ChatHistoryRepository:
             """,
             (scope_id, None, current_time, current_time),
         )
+
+    def _maybe_purge_expired_history(self, connection: sqlite3.Connection, current_time: float) -> None:
+        if self.cleanup_interval_seconds > 0:
+            now_monotonic = time.monotonic()
+            if self._last_cleanup_monotonic and (
+                now_monotonic - self._last_cleanup_monotonic
+            ) < self.cleanup_interval_seconds:
+                return
+        else:
+            now_monotonic = 0.0
+
+        cutoff = current_time - self.ttl_seconds
+        connection.execute(
+            """
+            DELETE FROM conversations
+            WHERE updated_at <= ?
+            """,
+            (cutoff,),
+        )
+        connection.execute(
+            """
+            DELETE FROM conversation_scopes
+            WHERE updated_at <= ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM conversations
+                  WHERE conversations.scope_id = conversation_scopes.scope_id
+              )
+            """,
+            (cutoff,),
+        )
+        self._last_cleanup_monotonic = now_monotonic
 
     def _load_visible_messages(
         self,
@@ -558,14 +615,24 @@ class ChatHistoryRepository:
 
 
 class ConversationService:
-    def __init__(self) -> None:
-        history_db_path = os.getenv("COPILOT_CHAT_HISTORY_DB_PATH")
+    def __init__(
+        self,
+        history_db_path: str | os.PathLike[str] | None = None,
+        *,
+        ttl_seconds: int = DEFAULT_CHAT_HISTORY_TTL_SECONDS,
+        cleanup_interval_seconds: int = DEFAULT_CHAT_HISTORY_CLEANUP_INTERVAL_SECONDS,
+    ) -> None:
+        configured_history_db_path = history_db_path or os.getenv("COPILOT_CHAT_HISTORY_DB_PATH")
         self.history_db_path = (
-            Path(history_db_path)
-            if history_db_path
+            Path(configured_history_db_path)
+            if configured_history_db_path
             else DEFAULT_CHAT_HISTORY_DB_PATH
         )
-        self._repository = ChatHistoryRepository(self.history_db_path)
+        self._repository = ChatHistoryRepository(
+            self.history_db_path,
+            ttl_seconds=ttl_seconds,
+            cleanup_interval_seconds=cleanup_interval_seconds,
+        )
 
     def get_state_payload(self, scope_id: str) -> dict[str, Any]:
         return self._repository.get_state_payload(scope_id)

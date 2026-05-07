@@ -79,10 +79,20 @@ class ChatRequest(BaseModel):
 
 class ConversationCreateRequest(BaseModel):
     model: str | None = None
+    credentialEnvelope: str | None = None
+
+
+class ConversationStateRequest(BaseModel):
+    credentialEnvelope: str | None = None
+
+
+class ConversationActivateRequest(BaseModel):
+    credentialEnvelope: str | None = None
 
 
 class ConversationModelRequest(BaseModel):
     model: str | None = None
+    credentialEnvelope: str | None = None
 
 
 class ConversationMessageRequest(BaseModel):
@@ -111,6 +121,11 @@ def _format_log_context(log_context: dict[str, Any]) -> str:
 def _apply_browser_session_cookie(response: Response, browser_session: BrowserSessionContext) -> None:
     if browser_session.created_session_cookie:
         auth_service.apply_session_cookie(response, browser_session.session_secret)
+
+
+def _apply_credential_envelope_header(response: Response, credential_envelope: str | None) -> None:
+    if credential_envelope:
+        response.headers["X-Copilot-Credential-Envelope"] = credential_envelope
 
 
 def _build_streaming_response(stream) -> StreamingResponse:
@@ -198,7 +213,26 @@ async def get_models() -> dict[str, list[dict[str, str]]]:
 async def get_conversations(request: Request, response: Response) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
     _apply_browser_session_cookie(response, browser_session)
-    return conversation_service.get_state_payload(browser_session.conversation_scope_id)
+    return conversation_service.get_state_payload(
+        auth_service.get_anonymous_history_scope(browser_session.conversation_scope_id)
+    )
+
+
+@app.post("/api/conversations/state")
+async def get_conversations_state(
+    request: Request,
+    response: Response,
+    payload: ConversationStateRequest,
+) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    _apply_browser_session_cookie(response, browser_session)
+    owner_context, refreshed_envelope = await auth_service.resolve_history_scope(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
+        browser_session.conversation_scope_id,
+    )
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return conversation_service.get_state_payload(owner_context.scope_id)
 
 
 @app.post("/api/conversations")
@@ -209,8 +243,14 @@ async def create_conversation(
 ) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
     model_id = chat_service.resolve_model(payload.model)
-    session = conversation_service.create_conversation(browser_session.conversation_scope_id, model_id)
+    owner_context, refreshed_envelope = await auth_service.resolve_history_scope(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
+        browser_session.conversation_scope_id,
+    )
+    session = conversation_service.create_conversation(owner_context.scope_id, model_id)
     _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
     return {
         "session": session,
         "activeSessionId": session["id"],
@@ -222,10 +262,17 @@ async def activate_conversation(
     conversation_id: str,
     request: Request,
     response: Response,
+    payload: ConversationActivateRequest | None = None,
 ) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
-    conversation_service.activate_conversation(browser_session.conversation_scope_id, conversation_id)
+    owner_context, refreshed_envelope = await auth_service.resolve_history_scope(
+        None if payload is None else payload.credentialEnvelope,
+        browser_session.session_secret,
+        browser_session.conversation_scope_id,
+    )
+    conversation_service.activate_conversation(owner_context.scope_id, conversation_id)
     _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
     return {"activeSessionId": conversation_id}
 
 
@@ -238,12 +285,18 @@ async def update_conversation_model(
 ) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
     model_id = chat_service.resolve_model(payload.model)
-    session = conversation_service.update_conversation_model(
+    owner_context, refreshed_envelope = await auth_service.resolve_history_scope(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
         browser_session.conversation_scope_id,
+    )
+    session = conversation_service.update_conversation_model(
+        owner_context.scope_id,
         conversation_id,
         model_id,
     )
     _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
     return {"session": session}
 
 
@@ -268,8 +321,9 @@ async def send_conversation_message(
         payload.credentialEnvelope,
         browser_session.session_secret,
     )
+    owner_context = auth_service.get_authenticated_history_owner(copilot_session)
     turn = conversation_service.begin_turn(
-        browser_session.conversation_scope_id,
+        owner_context.scope_id,
         conversation_id,
         content=content,
         model=model_id,
@@ -278,7 +332,7 @@ async def send_conversation_message(
     stream_response = _build_streaming_response(
         conversation_service.persist_stream(
             request=request,
-            scope_id=browser_session.conversation_scope_id,
+            scope_id=owner_context.scope_id,
             conversation_id=conversation_id,
             assistant_message_id=turn.assistant_message_id,
             stream=chat_service.stream_chat_completion(
@@ -307,10 +361,12 @@ async def get_copilot_status(
 ) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
     _apply_browser_session_cookie(response, browser_session)
-    return await auth_service.get_status_payload(
+    status_payload, refreshed_envelope = await auth_service.get_status_payload(
         payload.credentialEnvelope,
         browser_session.session_secret,
     )
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return status_payload
 
 
 @app.post("/api/copilot/login/start")
