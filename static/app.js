@@ -64,6 +64,7 @@ function createEmptyUsageMetric() {
         used: null,
         total: null,
         plan: null,
+        unlimited: false,
         status: "missing",
     };
 }
@@ -74,6 +75,7 @@ function createEmptyUsageSnapshot(reason = "not_authenticated") {
         reason,
         detail: null,
         source: null,
+        accessTypeSku: null,
         fetchedAt: 0,
         chatMessages: createEmptyUsageMetric(),
         premiumRequests: createEmptyUsageMetric(),
@@ -855,12 +857,14 @@ function normalizeUsageMetric(metric) {
     const remaining = normalizeUsageQuantity(metric?.remaining);
     const used = normalizeUsageQuantity(metric?.used);
     const total = normalizeUsageQuantity(metric?.total);
-    const hasQuotaBasis = remaining !== null || used !== null || total !== null;
+    const unlimited = Boolean(metric?.unlimited);
+    const hasQuotaBasis = remaining !== null || used !== null || total !== null || unlimited;
     return {
         remaining,
         used,
         total,
         plan: normalizeUsagePlan(metric?.plan),
+        unlimited,
         status: hasQuotaBasis ? "available" : "missing",
     };
 }
@@ -895,6 +899,7 @@ function normalizeUsageSnapshot(snapshot) {
         reason,
         detail: null,
         source: typeof snapshot?.source === "string" ? snapshot.source : null,
+        accessTypeSku: typeof snapshot?.accessTypeSku === "string" ? snapshot.accessTypeSku : null,
         fetchedAt: Number.isFinite(Number(snapshot?.fetchedAt)) ? Number(snapshot.fetchedAt) : 0,
         chatMessages: normalizeUsageMetric(snapshot?.chatMessages),
         premiumRequests: normalizeUsageMetric(snapshot?.premiumRequests),
@@ -910,15 +915,25 @@ function formatUsageCount(value) {
 }
 
 function formatUsageRemaining(metric) {
+    if (metric?.unlimited) {
+        return "무제한";
+    }
     return formatUsageCount(metric?.remaining) ?? "-";
 }
 
 function isUnlimitedChatMessages(snapshot, metric) {
-    return Boolean(
+    return Boolean(metric?.unlimited) || Boolean(
         snapshot?.source === "copilot_user_api"
         && metric?.status === "available"
         && Number(metric?.remaining) === 0
         && Number.isFinite(snapshot?.premiumRequests?.remaining),
+    );
+}
+
+function shouldHidePremiumUsage(snapshot, metric) {
+    return Boolean(
+        snapshot?.accessTypeSku === "free_limited_copilot"
+        && metric?.status !== "available",
     );
 }
 
@@ -1137,6 +1152,8 @@ function resetUsageSnapshot(reason = "not_authenticated") {
 function renderUsageSummary() {
     const usage = normalizeUsageSnapshot(state.copilot.usage);
     state.copilot.usage = usage;
+    const hidePremiumUsage = shouldHidePremiumUsage(usage, usage.premiumRequests);
+    const authPremiumRow = elements.authPremiumRequestsRemaining?.parentElement;
 
     elements.usageSummary.dataset.status = usage.status;
     applyUsageMetricVisual(
@@ -1148,19 +1165,27 @@ function renderUsageSummary() {
         usage,
         usage.chatMessages,
     );
-    applyUsageMetricVisual(
-        elements.premiumRequestsCard,
-        elements.premiumRequestsRemaining,
-        elements.premiumRequestsChartFill,
-        elements.premiumRequestsMeta,
-        "premiumRequests",
-        usage,
-        usage.premiumRequests,
-    );
+    elements.premiumRequestsCard.hidden = hidePremiumUsage;
+    if (authPremiumRow) {
+        authPremiumRow.hidden = hidePremiumUsage;
+    }
+    if (!hidePremiumUsage) {
+        applyUsageMetricVisual(
+            elements.premiumRequestsCard,
+            elements.premiumRequestsRemaining,
+            elements.premiumRequestsChartFill,
+            elements.premiumRequestsMeta,
+            "premiumRequests",
+            usage,
+            usage.premiumRequests,
+        );
+    }
     elements.usageSummaryDetail.textContent = describeUsageSummary(usage);
 
     elements.authChatMessagesRemaining.textContent = formatUsageRemaining(usage.chatMessages);
-    elements.authPremiumRequestsRemaining.textContent = formatPremiumUsagePrimaryValue(usage, usage.premiumRequests);
+    if (!hidePremiumUsage) {
+        elements.authPremiumRequestsRemaining.textContent = formatPremiumUsagePrimaryValue(usage, usage.premiumRequests);
+    }
     elements.authUsageDetail.textContent = describeUsageSummary(usage);
     syncUsageSummaryLayout();
 }

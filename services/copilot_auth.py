@@ -1292,10 +1292,16 @@ class CopilotAuthService:
             "used": None,
             "total": None,
             "plan": None,
+            "unlimited": False,
             "status": "missing",
         }
 
     def _normalize_usage_snapshot(self, payload: dict[str, Any], *, source: str | None) -> dict[str, Any]:
+        if self._is_free_limited_usage_payload(payload):
+            return self._normalize_free_limited_usage_snapshot(payload, source=source)
+        if self._is_quota_snapshots_usage_payload(payload):
+            return self._normalize_quota_snapshots_usage_snapshot(payload, source=source)
+
         chat_payload = self._build_usage_metric_payload(
             payload,
             aliases=(("chat", "messages"), ("chat",)),
@@ -1329,8 +1335,165 @@ class CopilotAuthService:
             "detail": detail,
             "source": source,
             "fetchedAt": time.time(),
+            "accessTypeSku": self._normalize_text(payload.get("access_type_sku")),
             "chatMessages": chat_payload,
             "premiumRequests": premium_payload,
+        }
+
+    def _is_free_limited_usage_payload(self, payload: dict[str, Any]) -> bool:
+        access_type_sku = payload.get("access_type_sku")
+        limited_user_quotas = payload.get("limited_user_quotas")
+        monthly_quotas = payload.get("monthly_quotas")
+        return (
+            isinstance(access_type_sku, str)
+            and access_type_sku.strip().lower() == "free_limited_copilot"
+            and isinstance(limited_user_quotas, dict)
+            and isinstance(monthly_quotas, dict)
+        )
+
+    def _normalize_free_limited_usage_snapshot(
+        self,
+        payload: dict[str, Any],
+        *,
+        source: str | None,
+    ) -> dict[str, Any]:
+        limited_user_quotas = payload.get("limited_user_quotas")
+        monthly_quotas = payload.get("monthly_quotas")
+        if not isinstance(limited_user_quotas, dict) or not isinstance(monthly_quotas, dict):
+            return self._usage_snapshot_unavailable(
+                reason="copilot_usage_shape_unrecognized",
+                source=source,
+            )
+
+        remaining_chat = self._normalize_usage_basis_value(
+            self._coerce_usage_number(limited_user_quotas.get("chat"))
+        )
+        total_chat = self._normalize_usage_total_value(
+            self._coerce_usage_number(monthly_quotas.get("chat"))
+        )
+        used_chat: int | None = None
+        if isinstance(remaining_chat, int) and isinstance(total_chat, int) and total_chat >= remaining_chat:
+            used_chat = total_chat - remaining_chat
+
+        chat_payload = {
+            "remaining": remaining_chat,
+            "used": used_chat,
+            "total": total_chat,
+            "plan": self._normalize_text(payload.get("copilot_plan"))
+            or self._normalize_text(payload.get("access_type_sku")),
+            "unlimited": False,
+            "status": "available"
+            if remaining_chat is not None or total_chat is not None or used_chat is not None
+            else "missing",
+        }
+        premium_payload = self._empty_usage_metric()
+
+        status = "partial"
+        reason = "copilot_usage_partial"
+        if chat_payload["status"] == "missing":
+            status = "unavailable"
+            reason = "copilot_usage_shape_unrecognized"
+
+        return {
+            "status": status,
+            "reason": reason,
+            "detail": self._usage_detail(reason),
+            "source": source,
+            "fetchedAt": time.time(),
+            "accessTypeSku": self._normalize_text(payload.get("access_type_sku")),
+            "chatMessages": chat_payload,
+            "premiumRequests": premium_payload,
+        }
+
+    def _is_quota_snapshots_usage_payload(self, payload: dict[str, Any]) -> bool:
+        quota_snapshots = payload.get("quota_snapshots")
+        return isinstance(quota_snapshots, dict) and any(
+            key in quota_snapshots for key in ("chat", "premium_interactions", "completions")
+        )
+
+    def _normalize_quota_snapshots_usage_snapshot(
+        self,
+        payload: dict[str, Any],
+        *,
+        source: str | None,
+    ) -> dict[str, Any]:
+        quota_snapshots = payload.get("quota_snapshots")
+        if not isinstance(quota_snapshots, dict):
+            return self._usage_snapshot_unavailable(
+                reason="copilot_usage_shape_unrecognized",
+                source=source,
+            )
+
+        plan = self._normalize_text(payload.get("copilot_plan")) or self._normalize_text(
+            payload.get("access_type_sku")
+        )
+        chat_payload = self._normalize_quota_snapshot_metric(
+            quota_snapshots.get("chat"),
+            plan=plan,
+        )
+        premium_payload = self._normalize_quota_snapshot_metric(
+            quota_snapshots.get("premium_interactions"),
+            plan=plan,
+        )
+
+        if chat_payload["status"] == "missing" and premium_payload["status"] == "missing":
+            return self._usage_snapshot_unavailable(
+                reason="copilot_usage_shape_unrecognized",
+                source=source,
+            )
+
+        detail = None
+        status = "ok"
+        reason = "copilot_usage_ok"
+        if chat_payload["status"] == "missing" or premium_payload["status"] == "missing":
+            status = "partial"
+            reason = "copilot_usage_partial"
+            detail = self._usage_detail(reason)
+
+        return {
+            "status": status,
+            "reason": reason,
+            "detail": detail,
+            "source": source,
+            "fetchedAt": time.time(),
+            "accessTypeSku": self._normalize_text(payload.get("access_type_sku")),
+            "chatMessages": chat_payload,
+            "premiumRequests": premium_payload,
+        }
+
+    def _normalize_quota_snapshot_metric(
+        self,
+        raw_metric: Any,
+        *,
+        plan: str | None,
+    ) -> dict[str, Any]:
+        if not isinstance(raw_metric, dict):
+            return self._empty_usage_metric()
+
+        unlimited = bool(raw_metric.get("unlimited"))
+        remaining = self._normalize_usage_basis_value(
+            self._coerce_usage_number(raw_metric.get("remaining"))
+        )
+        total = self._normalize_usage_total_value(
+            self._coerce_usage_number(raw_metric.get("entitlement"))
+        )
+        used: int | None = None
+        if isinstance(remaining, int) and isinstance(total, int) and total >= remaining:
+            used = total - remaining
+
+        has_quota_basis = remaining is not None or total is not None or used is not None
+        if unlimited:
+            remaining = None
+            total = None
+            used = None
+
+        return {
+            "remaining": remaining,
+            "used": used,
+            "total": total,
+            "plan": plan,
+            "unlimited": unlimited,
+            "status": "available" if unlimited or has_quota_basis else "missing",
         }
 
     def _build_usage_metric_payload(
