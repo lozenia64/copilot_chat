@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 auth_service = CopilotAuthService()
 chat_service = CopilotChatService(config_path=CONFIG_PATH, default_model=DEFAULT_MODEL)
 conversation_service = ConversationService()
+LOGGER = logging.getLogger("uvicorn.error")
 
 
 @dataclass(slots=True)
@@ -94,11 +96,16 @@ class ConversationMessageRequest(BaseModel):
 
 def _resolve_browser_session_context(request: Request) -> BrowserSessionContext:
     session_secret, created = auth_service.get_or_create_session_secret(request)
+    request.state.browser_session_cookie_created = created
     return BrowserSessionContext(
         session_secret=session_secret,
         conversation_scope_id=auth_service.get_conversation_scope(session_secret),
         created_session_cookie=created,
     )
+
+
+def _format_log_context(log_context: dict[str, Any]) -> str:
+    return ", ".join(f"{key}={value}" for key, value in log_context.items() if value is not None)
 
 
 def _apply_browser_session_cookie(response: Response, browser_session: BrowserSessionContext) -> None:
@@ -119,7 +126,25 @@ def _build_streaming_response(stream) -> StreamingResponse:
 
 
 @app.exception_handler(CopilotAuthError)
-async def handle_copilot_auth_error(_: Request, exc: CopilotAuthError) -> JSONResponse:
+async def handle_copilot_auth_error(request: Request, exc: CopilotAuthError) -> JSONResponse:
+    if exc.code in {"copilot_login_session_mismatch", "copilot_upstream_error"}:
+        log_context = {
+            "method": request.method,
+            "path": request.url.path,
+            "status_code": exc.status_code,
+            "code": exc.code,
+            "host": request.headers.get("host"),
+            "origin": request.headers.get("origin"),
+            "referer": request.headers.get("referer"),
+            "client_host": request.client.host if request.client is not None else None,
+            "browser_session_cookie_created": getattr(
+                request.state,
+                "browser_session_cookie_created",
+                None,
+            ),
+        }
+        log_context.update(exc.log_context)
+        LOGGER.warning("Copilot auth error: %s", _format_log_context(log_context))
     return JSONResponse(
         status_code=exc.status_code,
         content={"message": exc.message, "code": exc.code},

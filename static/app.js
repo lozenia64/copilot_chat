@@ -1201,6 +1201,10 @@ function resolveServerErrorMessage(code, fallback = "요청을 처리하지 못�
         return fallback;
     }
 
+    if (code === "copilot_upstream_error" && fallback) {
+        return fallback;
+    }
+
     return SERVER_ERROR_MESSAGES[code] || fallback;
 }
 
@@ -1215,10 +1219,14 @@ async function extractErrorResponse(response) {
     if (contentType.includes("application/json")) {
         try {
             const payload = await response.json();
+            const payloadMessage =
+                typeof payload?.message === "string" && payload.message.trim()
+                    ? payload.message.trim()
+                    : fallback.message;
             const code = extractServerErrorCode(payload);
             return {
-                message: resolveServerErrorMessage(code, fallback.message),
-                code,
+                message: resolveServerErrorMessage(code, payloadMessage),
+                code: typeof payload?.code === "string" ? payload.code : code,
             };
         } catch {
             return fallback;

@@ -1439,6 +1439,51 @@ class CopilotApiTests(unittest.TestCase):
         self.assertEqual(payload["code"], "copilot_login_invalid")
         self.assertEqual(payload["message"], "로그인 세션을 확인할 수 없습니다. 다시 로그인하세요.")
 
+    def test_login_poll_from_different_browser_session_logs_session_mismatch_details(self) -> None:
+        with patch.object(
+            self.main.auth_service,
+            "_request_device_code",
+            AsyncMock(
+                return_value={
+                    "device_code": "device-code",
+                    "user_code": "user-code",
+                    "verification_uri": "https://github.com/login/device",
+                    "interval": 5,
+                    "expires_in": 900,
+                }
+            ),
+        ):
+            start_response = self.client.post("/api/copilot/login/start")
+
+        self.assertEqual(start_response.status_code, 200)
+        login_id = start_response.json()["loginId"]
+
+        other_client = TestClient(self.main.app)
+        try:
+            with patch.object(self.main.LOGGER, "warning") as logger_warning:
+                response = other_client.post(
+                    "/api/copilot/login/poll",
+                    json={"loginId": login_id},
+                )
+
+            self.assertEqual(response.status_code, 403)
+            payload = response.json()
+            self.assertEqual(payload["code"], "copilot_login_session_mismatch")
+            self.assertEqual(
+                payload["message"],
+                "현재 브라우저 세션과 맞지 않는 로그인 요청입니다. 다시 시도하세요.",
+            )
+
+            logger_warning.assert_called_once()
+            self.assertEqual(logger_warning.call_args.args[0], "Copilot auth error: %s")
+            log_line = logger_warning.call_args.args[1]
+            self.assertIn("path=/api/copilot/login/poll", log_line)
+            self.assertIn("code=copilot_login_session_mismatch", log_line)
+            self.assertIn("browser_session_cookie_created=True", log_line)
+            self.assertIn("reason=browser_session_changed_or_missing_cookie", log_line)
+        finally:
+            other_client.close()
+
     def test_chat_validation_returns_safe_error_contract(self) -> None:
         response = self.client.post(
             "/api/chat",

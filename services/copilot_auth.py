@@ -94,11 +94,19 @@ class CopilotCompletedLogin:
 
 
 class CopilotAuthError(Exception):
-    def __init__(self, status_code: int, message: str, code: str) -> None:
+    def __init__(
+        self,
+        status_code: int,
+        message: str,
+        code: str,
+        *,
+        log_context: dict[str, Any] | None = None,
+    ) -> None:
         super().__init__(message)
         self.status_code = status_code
         self.message = message
         self.code = code
+        self.log_context = {} if log_context is None else log_context
 
 
 class PendingLoginStore:
@@ -1039,11 +1047,29 @@ class CopilotAuthService:
         handle: CopilotLoginHandle,
         pending: CopilotLoginTicket | CopilotCompletedLogin,
     ) -> None:
-        if handle.session_binding != current_binding or pending.session_binding != current_binding:
+        handle_matches_current = handle.session_binding == current_binding
+        pending_matches_current = pending.session_binding == current_binding
+        handle_matches_pending = handle.session_binding == pending.session_binding
+        if not handle_matches_current or not pending_matches_current:
             raise CopilotAuthError(
                 status_code=403,
                 message="현재 브라우저 세션과 맞지 않는 로그인 요청입니다. 다시 시도하세요.",
                 code="copilot_login_session_mismatch",
+                log_context={
+                    "flow_id_prefix": self._debug_prefix(handle.flow_id),
+                    "login_state": "completed" if isinstance(pending, CopilotCompletedLogin) else "pending",
+                    "handle_version": handle.version,
+                    "pending_version": pending.version,
+                    "handle_matches_current": handle_matches_current,
+                    "pending_matches_current": pending_matches_current,
+                    "handle_matches_pending": handle_matches_pending,
+                    "reason": self._session_mismatch_reason(
+                        handle_matches_current=handle_matches_current,
+                        pending_matches_current=pending_matches_current,
+                        handle_matches_pending=handle_matches_pending,
+                    ),
+                    "ephemeral_secret": self.is_ephemeral_secret,
+                },
             )
 
     def _pending_login_response(
@@ -1529,6 +1555,27 @@ class CopilotAuthService:
         ).digest()
         return base64.urlsafe_b64encode(digest).decode("utf-8").rstrip("=")
 
+    @staticmethod
+    def _debug_prefix(value: str, width: int = 8) -> str:
+        if not value:
+            return ""
+        return value[:width]
+
+    @staticmethod
+    def _session_mismatch_reason(
+        *,
+        handle_matches_current: bool,
+        pending_matches_current: bool,
+        handle_matches_pending: bool,
+    ) -> str:
+        if handle_matches_pending and not handle_matches_current and not pending_matches_current:
+            return "browser_session_changed_or_missing_cookie"
+        if pending_matches_current and not handle_matches_current:
+            return "stale_or_cross_session_login_id"
+        if handle_matches_current and not pending_matches_current:
+            return "pending_store_binding_drift"
+        return "inconsistent_login_binding_state"
+
     def _credential_id(self, access_token: str) -> str:
         return hashlib.sha256(access_token.encode("utf-8")).hexdigest()[:12]
 
@@ -1562,10 +1609,21 @@ class CopilotAuthService:
             ) from exc
 
         if response.status_code >= 400:
+            upstream_hint = self._infer_upstream_failure_hint(
+                upstream_url=str(response.request.url),
+                status_code=response.status_code,
+                payload=payload,
+                github_sso_header=response.headers.get("x-github-sso"),
+            )
             raise CopilotAuthError(
                 status_code=response.status_code,
-                message=fallback_message,
+                message=self._upstream_user_message(
+                    payload=payload,
+                    fallback_message=fallback_message,
+                    upstream_hint=upstream_hint,
+                ),
                 code="copilot_upstream_error",
+                log_context=self._upstream_error_log_context(response, payload),
             )
 
         if isinstance(payload, dict):
@@ -1580,6 +1638,165 @@ class CopilotAuthService:
     @staticmethod
     def _derive_binding_key(secret: str) -> bytes:
         return hashlib.sha256(f"copilot-binding:{secret}".encode("utf-8")).digest()
+
+    def _upstream_error_log_context(
+        self,
+        response: httpx.Response,
+        payload: Any,
+    ) -> dict[str, Any]:
+        upstream_url = str(response.request.url)
+        sanitized_payload = self._sanitize_upstream_payload(payload)
+        body_excerpt = self._upstream_body_excerpt(sanitized_payload)
+        return {
+            "upstream_stage": self._upstream_stage(upstream_url),
+            "upstream_url": upstream_url,
+            "upstream_status_code": response.status_code,
+            "upstream_request_method": response.request.method,
+            "upstream_github_request_id": response.headers.get("x-github-request-id"),
+            "upstream_github_sso": response.headers.get("x-github-sso"),
+            "upstream_www_authenticate": response.headers.get("www-authenticate"),
+            "upstream_content_type": response.headers.get("content-type"),
+            "upstream_hint": self._infer_upstream_failure_hint(
+                upstream_url=upstream_url,
+                status_code=response.status_code,
+                payload=sanitized_payload,
+                github_sso_header=response.headers.get("x-github-sso"),
+            ),
+            "upstream_body_excerpt": body_excerpt,
+        }
+
+    @staticmethod
+    def _upstream_stage(upstream_url: str) -> str:
+        if upstream_url.endswith("/login/device/code"):
+            return "device_code"
+        if upstream_url.endswith("/login/oauth/access_token"):
+            return "device_access_token"
+        if "/copilot_internal/v2/token" in upstream_url:
+            return "copilot_token"
+        if "/copilot_internal/" in upstream_url:
+            return "copilot_api"
+        return "unknown"
+
+    def _infer_upstream_failure_hint(
+        self,
+        *,
+        upstream_url: str,
+        status_code: int,
+        payload: Any,
+        github_sso_header: str | None,
+    ) -> str | None:
+        if status_code not in {401, 403}:
+            return None
+
+        stage = self._upstream_stage(upstream_url)
+        body_text = self._normalized_upstream_text(payload)
+        sso_text = (github_sso_header or "").strip().lower()
+
+        if any(term in sso_text for term in ("required", "partial")) or any(
+            term in body_text for term in ("sso", "saml", "reauthorize")
+        ):
+            return "sso_or_managed_account_authorization_required"
+
+        if any(term in body_text for term in ("enterprise", "organization", "org ", "policy", "business")):
+            return "organization_or_enterprise_policy_may_be_blocking_copilot"
+
+        if any(
+            term in body_text
+            for term in (
+                "not enabled",
+                "not entitled",
+                "entitlement",
+                "no access",
+                "not allowed",
+                "copilot",
+                "license",
+                "seat",
+            )
+        ):
+            return "account_may_not_have_copilot_entitlement"
+
+        if stage == "copilot_token":
+            return "copilot_token_request_forbidden_check_entitlement_or_org_policy"
+        if stage == "device_access_token":
+            return "device_flow_token_exchange_forbidden_or_client_restricted"
+        return "github_upstream_auth_or_policy_rejected_request"
+
+    def _upstream_user_message(
+        self,
+        *,
+        payload: Any,
+        fallback_message: str,
+        upstream_hint: str | None,
+    ) -> str:
+        if upstream_hint == "account_may_not_have_copilot_entitlement":
+            login = self._extract_upstream_login(payload)
+            if login:
+                return (
+                    f"현재 로그인한 GitHub 계정({login})에 GitHub Copilot 권한이 없습니다. "
+                    "Copilot이 활성화된 계정으로 다시 로그인하거나, 해당 계정에 Copilot 권한이 있는지 확인하세요."
+                )
+            return (
+                "현재 로그인한 GitHub 계정에 GitHub Copilot 권한이 없습니다. "
+                "Copilot이 활성화된 계정으로 다시 로그인하거나, 해당 계정에 Copilot 권한이 있는지 확인하세요."
+            )
+
+        if upstream_hint == "organization_or_enterprise_policy_may_be_blocking_copilot":
+            return (
+                "현재 로그인한 GitHub 계정은 조직 또는 엔터프라이즈 정책 때문에 Copilot 사용이 차단된 것 같습니다. "
+                "조직 관리자에게 Copilot seat 또는 정책 설정을 확인하세요."
+            )
+
+        if upstream_hint == "sso_or_managed_account_authorization_required":
+            return (
+                "현재 로그인한 GitHub 계정은 조직 SSO 또는 관리형 계정 승인 절차가 필요합니다. "
+                "GitHub에서 조직 접근 권한을 승인한 뒤 다시 시도하세요."
+            )
+
+        return fallback_message
+
+    def _extract_upstream_login(self, payload: Any) -> str | None:
+        payload_text = self._upstream_body_excerpt(payload, max_length=1000)
+        match = re.search(r"logged in as ([A-Za-z0-9-]+)", payload_text, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
+
+    def _normalized_upstream_text(self, payload: Any) -> str:
+        excerpt = self._upstream_body_excerpt(payload)
+        return excerpt.lower()
+
+    def _upstream_body_excerpt(self, payload: Any, max_length: int = 280) -> str:
+        if isinstance(payload, (dict, list)):
+            text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        else:
+            text = str(payload)
+        compact = re.sub(r"\s+", " ", text).strip()
+        if len(compact) <= max_length:
+            return compact
+        return f"{compact[:max_length - 3]}..."
+
+    def _sanitize_upstream_payload(self, payload: Any) -> Any:
+        if isinstance(payload, dict):
+            sanitized: dict[str, Any] = {}
+            for key, value in payload.items():
+                lowered = str(key).lower()
+                if any(secret_key in lowered for secret_key in ("token", "secret", "password")):
+                    sanitized[str(key)] = "[redacted]"
+                elif lowered == "access_token":
+                    sanitized[str(key)] = "[redacted]"
+                else:
+                    sanitized[str(key)] = self._sanitize_upstream_payload(value)
+            return sanitized
+        if isinstance(payload, list):
+            return [self._sanitize_upstream_payload(item) for item in payload]
+        if isinstance(payload, str):
+            return self._redact_upstream_text(payload)
+        return payload
+
+    @staticmethod
+    def _redact_upstream_text(value: str) -> str:
+        redacted = re.sub(r"(?i)(access[_-]?token|refresh[_-]?token|token|secret|password)\s*[:=]\s*[^,\s]+", r"\1=[redacted]", value)
+        return re.sub(r"\bgh[opusr]_[A-Za-z0-9_]+\b", "[redacted]", redacted)
 
     @staticmethod
     def _derive_fernet_key(secret: str) -> bytes:
