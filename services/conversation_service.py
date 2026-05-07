@@ -684,7 +684,11 @@ class ConversationService:
         return None
 
     def _is_stream_error_payload(self, payload: dict[str, Any]) -> bool:
-        return payload.get("code") in {"copilot_chat_stream_failed", "copilot_rate_limit_exceeded"}
+        return payload.get("code") in {
+            "copilot_chat_stream_failed",
+            "copilot_model_not_supported",
+            "copilot_rate_limit_exceeded",
+        }
 
     def _extract_stream_text(self, payload: dict[str, Any]) -> str:
         choices = payload.get("choices")

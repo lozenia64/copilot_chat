@@ -150,9 +150,10 @@ class CopilotChatService:
             yield b"data: [DONE]\n\n"
 
     def _log_stream_failure(self, exc: Exception) -> None:
+        error_code = self._stream_error_payload(exc)["code"]
         LOGGER.warning(
             "Copilot chat streaming failed; returning sanitized SSE error (%s)",
-            "internal_error",
+            error_code,
             exc_info=exc,
         )
 
@@ -317,6 +318,11 @@ class CopilotChatService:
     def _stream_error_payload(self, exc: Exception | None = None) -> dict[str, Any]:
         if exc is not None:
             exc_str = str(exc).lower()
+            if "model_not_supported" in exc_str or "requested model is not supported" in exc_str:
+                return {
+                    "code": "copilot_model_not_supported",
+                    "message": "현재 로그인 되어있는 GitHub 계정에서는 해당 모델을 사용할 수 없습니다.",
+                }
             if "ratelimiterror" in type(exc).__name__.lower() or "rate limit" in exc_str or "429" in exc_str:
                 return {
                     "code": "copilot_rate_limit_exceeded",
