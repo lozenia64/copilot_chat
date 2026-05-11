@@ -95,6 +95,11 @@ class ConversationModelRequest(BaseModel):
     credentialEnvelope: str | None = None
 
 
+class ConversationTitleRequest(BaseModel):
+    title: str
+    credentialEnvelope: str | None = None
+
+
 class ConversationMessageRequest(BaseModel):
     content: str
     model: str | None = None
@@ -294,6 +299,52 @@ async def update_conversation_model(
         owner_context.scope_id,
         conversation_id,
         model_id,
+    )
+    _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return {"session": session}
+
+
+@app.post("/api/conversations/{conversation_id}/delete")
+async def delete_conversation(
+    conversation_id: str,
+    request: Request,
+    response: Response,
+    payload: ConversationStateRequest | None = None,
+) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    owner_context, refreshed_envelope = await auth_service.resolve_history_scope(
+        None if payload is None else payload.credentialEnvelope,
+        browser_session.session_secret,
+        browser_session.conversation_scope_id,
+    )
+    state_payload = conversation_service.delete_conversation(
+        owner_context.scope_id,
+        conversation_id,
+    )
+    _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return state_payload
+
+
+@app.post("/api/conversations/{conversation_id}/title")
+async def update_conversation_title(
+    conversation_id: str,
+    request: Request,
+    response: Response,
+    payload: ConversationTitleRequest,
+) -> dict[str, Any]:
+    browser_session = _resolve_browser_session_context(request)
+    title = conversation_service.validate_conversation_title(payload.title)
+    owner_context, refreshed_envelope = await auth_service.resolve_history_scope(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
+        browser_session.conversation_scope_id,
+    )
+    session = conversation_service.update_conversation_title(
+        owner_context.scope_id,
+        conversation_id,
+        title,
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)

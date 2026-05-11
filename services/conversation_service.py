@@ -20,6 +20,7 @@ DEFAULT_CONVERSATION_TITLE = "새 대화"
 DEFAULT_ASSISTANT_STATE = "complete"
 DEFAULT_CHAT_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 7
 DEFAULT_CHAT_HISTORY_CLEANUP_INTERVAL_SECONDS = 60
+MAX_CONVERSATION_TITLE_LENGTH = 80
 
 
 @dataclass(slots=True)
@@ -179,6 +180,65 @@ class ChatHistoryRepository:
 
         return self.get_conversation_payload(scope_id, conversation_id)
 
+    def update_conversation_title(self, scope_id: str, conversation_id: str, title: str) -> dict[str, Any]:
+        current_time = time.time()
+        with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
+            self._require_conversation(connection, scope_id, conversation_id)
+            connection.execute(
+                """
+                UPDATE conversations
+                SET title = ?, updated_at = ?
+                WHERE id = ? AND scope_id = ?
+                """,
+                (title, current_time, conversation_id, scope_id),
+            )
+
+        return self.get_conversation_payload(scope_id, conversation_id)
+
+    def delete_conversation(self, scope_id: str, conversation_id: str) -> dict[str, Any]:
+        current_time = time.time()
+        with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
+            self._require_conversation(connection, scope_id, conversation_id)
+            connection.execute(
+                """
+                DELETE FROM conversations
+                WHERE id = ? AND scope_id = ?
+                """,
+                (conversation_id, scope_id),
+            )
+            scope_row = connection.execute(
+                """
+                SELECT active_conversation_id
+                FROM conversation_scopes
+                WHERE scope_id = ?
+                """,
+                (scope_id,),
+            ).fetchone()
+            if scope_row is not None and self._normalize_text(scope_row["active_conversation_id"]) == conversation_id:
+                next_active_row = connection.execute(
+                    """
+                    SELECT id
+                    FROM conversations
+                    WHERE scope_id = ?
+                    ORDER BY updated_at DESC, created_at DESC, id DESC
+                    LIMIT 1
+                    """,
+                    (scope_id,),
+                ).fetchone()
+                next_active_id = None if next_active_row is None else str(next_active_row["id"])
+                connection.execute(
+                    """
+                    UPDATE conversation_scopes
+                    SET active_conversation_id = ?, updated_at = ?
+                    WHERE scope_id = ?
+                    """,
+                    (next_active_id, current_time, scope_id),
+                )
+
+        return self.get_state_payload(scope_id)
+
     def begin_turn(
         self,
         scope_id: str,
@@ -254,7 +314,7 @@ class ChatHistoryRepository:
             )
             has_existing_user_message = any(message["role"] == "user" for message in visible_messages)
             title = str(conversation_row["title"])
-            if not has_existing_user_message:
+            if not has_existing_user_message and title == DEFAULT_CONVERSATION_TITLE:
                 title = self._derive_conversation_title(content)
             connection.execute(
                 """
@@ -649,6 +709,28 @@ class ConversationService:
             conversation_id,
             model,
         )
+
+    def validate_conversation_title(self, title: Any) -> str:
+        if not isinstance(title, str) or not title.strip():
+            raise ConversationStateError(
+                status_code=400,
+                message="대화 제목을 입력하세요.",
+                code="conversation_title_required",
+            )
+        normalized = re.sub(r"\s+", " ", title).strip()
+        if len(normalized) > MAX_CONVERSATION_TITLE_LENGTH:
+            normalized = normalized[:MAX_CONVERSATION_TITLE_LENGTH].rstrip()
+        return normalized
+
+    def update_conversation_title(self, scope_id: str, conversation_id: str, title: str) -> dict[str, Any]:
+        return self._repository.update_conversation_title(
+            scope_id,
+            conversation_id,
+            title,
+        )
+
+    def delete_conversation(self, scope_id: str, conversation_id: str) -> dict[str, Any]:
+        return self._repository.delete_conversation(scope_id, conversation_id)
 
     def validate_message_content(self, content: str) -> str:
         if not isinstance(content, str) or not content.strip():

@@ -3,6 +3,7 @@ const CREDENTIAL_STORAGE_KEY = window.APP_CONFIG?.credentialStorageKey ?? "copil
 const SERVER_ERROR_MESSAGES = Object.freeze({
     conversation_message_required: "보낼 메시지를 입력하세요.",
     conversation_not_found: "대화 세션을 찾을 수 없습니다. 새 대화를 시작하세요.",
+    conversation_title_required: "대화 제목을 입력하세요.",
     chat_messages_invalid: "채팅 메시지 형식이 올바르지 않습니다. 다시 시도하세요.",
     chat_model_not_allowed: "선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
     chat_model_required: "채팅 모델을 확인할 수 없습니다. 다시 시도하세요.",
@@ -465,6 +466,9 @@ function renderSidebar() {
 
     const fragment = document.createDocumentFragment();
     state.sessions.forEach((session) => {
+        const wrapper = document.createElement("div");
+        wrapper.className = "session-item-wrapper";
+
         const button = document.createElement("button");
         button.type = "button";
         button.className = `session-item${session.id === state.activeSessionId ? " active" : ""}`;
@@ -489,10 +493,191 @@ function renderSidebar() {
         button.addEventListener("click", () => {
             void selectSession(session.id);
         });
-        fragment.appendChild(button);
+
+        const editButton = document.createElement("button");
+        editButton.type = "button";
+        editButton.className = "session-edit-button";
+        editButton.setAttribute("aria-label", "대화 제목 수정");
+        editButton.title = "제목 수정";
+        editButton.innerHTML =
+            '<svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<path d="M12 20h9"></path>' +
+            '<path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>' +
+            '</svg>';
+        editButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            beginSessionTitleEdit(wrapper, session);
+        });
+
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "session-delete-button";
+        deleteButton.setAttribute("aria-label", "대화 삭제");
+        deleteButton.title = "대화 삭제";
+        deleteButton.innerHTML =
+            '<svg viewBox="0 0 24 24" width="14" height="14" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+            '<polyline points="3 6 5 6 21 6"></polyline>' +
+            '<path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path>' +
+            '<path d="M10 11v6"></path>' +
+            '<path d="M14 11v6"></path>' +
+            '<path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"></path>' +
+            '</svg>';
+        deleteButton.addEventListener("click", (event) => {
+            event.stopPropagation();
+            event.preventDefault();
+            void deleteSession(session.id, session.title);
+        });
+
+        wrapper.append(button, editButton, deleteButton);
+        fragment.appendChild(wrapper);
     });
 
     elements.sessionList.appendChild(fragment);
+}
+
+function beginSessionTitleEdit(wrapper, session) {
+    if (wrapper.classList.contains("editing")) {
+        return;
+    }
+    wrapper.classList.add("editing");
+
+    const titleEl = wrapper.querySelector(".session-title");
+    if (!titleEl) {
+        wrapper.classList.remove("editing");
+        return;
+    }
+
+    const originalTitle = session.title;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.className = "session-title-input";
+    input.maxLength = 80;
+    input.value = originalTitle;
+    input.setAttribute("aria-label", "대화 제목");
+
+    titleEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let settled = false;
+
+    const restoreTitleSpan = (titleText) => {
+        const span = document.createElement("span");
+        span.className = "session-title";
+        span.textContent = titleText;
+        if (input.parentNode) {
+            input.replaceWith(span);
+        }
+        wrapper.classList.remove("editing");
+    };
+
+    const cancel = () => {
+        if (settled) {
+            return;
+        }
+        settled = true;
+        restoreTitleSpan(originalTitle);
+    };
+
+    const commit = async () => {
+        if (settled) {
+            return;
+        }
+        const nextTitle = input.value.trim();
+        if (!nextTitle) {
+            cancel();
+            return;
+        }
+        if (nextTitle === originalTitle) {
+            cancel();
+            return;
+        }
+        settled = true;
+        input.disabled = true;
+        const saved = await persistSessionTitle(session.id, nextTitle, originalTitle);
+        if (saved) {
+            // renderSidebar 가 다시 호출되며 DOM 이 재구성되므로 별도 처리 불필요.
+            return;
+        }
+        // 실패 시 원복.
+        restoreTitleSpan(originalTitle);
+    };
+
+    input.addEventListener("keydown", (event) => {
+        if (event.key === "Enter") {
+            event.preventDefault();
+            void commit();
+        } else if (event.key === "Escape") {
+            event.preventDefault();
+            cancel();
+        }
+    });
+    input.addEventListener("blur", () => {
+        void commit();
+    });
+    input.addEventListener("click", (event) => {
+        event.stopPropagation();
+    });
+}
+
+async function persistSessionTitle(sessionId, nextTitle, previousTitle) {
+    const session = state.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+        return false;
+    }
+
+    try {
+        const payload = await requestJson(`/api/conversations/${encodeURIComponent(sessionId)}/title`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                title: nextTitle,
+                ...buildConversationScopePayload(),
+            }),
+        });
+        replaceSession(payload?.session);
+        renderSidebar();
+        return true;
+    } catch (error) {
+        session.title = previousTitle;
+        showToast(error.message || "대화 제목을 저장하지 못했습니다.", "error");
+        return false;
+    }
+}
+
+async function deleteSession(sessionId, sessionTitle) {
+    const session = state.sessions.find((item) => item.id === sessionId);
+    if (!session) {
+        return;
+    }
+
+    const label = sessionTitle && sessionTitle.trim() ? sessionTitle.trim() : "이 대화";
+    const confirmed = window.confirm(`"${label}" 대화를 삭제할까요? 이 작업은 되돌릴 수 없습니다.`);
+    if (!confirmed) {
+        return;
+    }
+
+    if (state.isStreaming && state.activeSessionId === sessionId) {
+        showToast("응답을 생성 중인 대화는 중지한 뒤 삭제하세요.", "error");
+        return;
+    }
+
+    try {
+        const payload = await requestJson(`/api/conversations/${encodeURIComponent(sessionId)}/delete`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify(buildConversationScopePayload()),
+        });
+        applyConversationStatePayload(payload);
+        showToast("대화를 삭제했습니다.", "info");
+    } catch (error) {
+        showToast(error.message || "대화를 삭제하지 못했습니다.", "error");
+    }
 }
 
 function renderMessages() {
