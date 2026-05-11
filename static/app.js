@@ -6,7 +6,6 @@ const SERVER_ERROR_MESSAGES = Object.freeze({
     chat_messages_invalid: "채팅 메시지 형식이 올바르지 않습니다. 다시 시도하세요.",
     chat_model_not_allowed: "선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
     chat_model_required: "채팅 모델을 확인할 수 없습니다. 다시 시도하세요.",
-    chat_search_mode_invalid: "검색 모드가 올바르지 않습니다. 다시 시도하세요.",
     copilot_access_token_failed: "GitHub 인증을 완료하지 못했습니다. 다시 시도하세요.",
     copilot_access_token_missing: "GitHub 액세스 토큰을 가져오지 못했습니다.",
     copilot_access_token_unreachable: "GitHub 로그인 상태를 확인하지 못했습니다. 잠시 후 다시 시도하세요.",
@@ -47,13 +46,32 @@ const MOBILE_VIEWPORT_MAX_WIDTH = 960;
 const COMPACT_VIEWPORT_MAX_HEIGHT = 720;
 const SIDEBAR_OVERLAY_HIDE_DELAY_MS = 180;
 const SIDEBAR_COLLAPSE_STORAGE_KEY = "localChatSidebarCollapsed";
-const EXPLICIT_SEARCH_PATTERNS = Object.freeze([
-    /^.+?(?:를|을)?\s*(?:웹\s*)?검색(?:\s*$|해|해서|해보|해봐|해보고|해\s*줘|해주세요|해주|해\s*줄래).*$/u,
-    /^(?:please\s+)?web\s+search(?:\s+for)?\s+.+$/i,
-    /^(?:please\s+)?search\s+for\s+.+$/i,
-    /^(?:please\s+)?look\s+up\s+.+$/i,
-    /^(?:please\s+)?find\s+(?:online|on\s+the\s+web)\s+.+$/i,
-]);
+// 매 채팅 요청에 함께 보내는 OpenAI 형식의 web_search function tool 스펙.
+// 사용자가 명시적으로 "검색해줘" 라고 말하지 않더라도, 모델이 최신 정보·실시간
+// 데이터·외부 출처가 필요하다고 판단하면 자동으로 이 도구를 호출한다. 실제 검색
+// 실행은 서버 측에서 이루어지고, 브라우저는 텍스트 SSE 만 소비한다.
+const WEB_SEARCH_TOOL_SPEC = Object.freeze({
+    type: "function",
+    function: {
+        name: "web_search",
+        description:
+            "최신 정보, 실시간 데이터, 외부 출처가 필요한 사용자 요청에 답하기 위해 웹을 검색한다. " +
+            "사용자가 명시적으로 검색을 요청한 경우뿐 아니라, 현재 시점의 날씨/뉴스/시세/공식 발표 등 모델이 자체 지식만으로 정확히 답할 수 없는 경우에 사용한다.",
+        parameters: {
+            type: "object",
+            properties: {
+                query: {
+                    type: "string",
+                    description: "검색 엔진에 입력할 검색어. 사용자의 의도를 압축한 키워드 형태로 작성한다.",
+                },
+            },
+            required: ["query"],
+            additionalProperties: false,
+        },
+    },
+});
+const CHAT_TOOLS_PAYLOAD = Object.freeze([WEB_SEARCH_TOOL_SPEC]);
+const CHAT_TOOL_CHOICE = "auto";
 const USAGE_VISUAL_CONFIG = Object.freeze({
     chatMessages: { low: 5, medium: 20, high: 60 },
 });
@@ -551,15 +569,6 @@ function escapeHtml(value) {
         .replace(/>/g, "&gt;")
         .replace(/"/g, "&quot;")
         .replace(/'/g, "&#39;");
-}
-
-function resolveSearchModeForPrompt(content) {
-    const normalized = typeof content === "string" ? content.trim() : "";
-    if (!normalized) {
-        return null;
-    }
-
-    return EXPLICIT_SEARCH_PATTERNS.some((pattern) => pattern.test(normalized)) ? "auto" : null;
 }
 
 function renderInlineHtml(text) {
@@ -1898,7 +1907,6 @@ async function sendPrompt() {
     let shouldResyncConversation = false;
     let didPersistTurn = false;
     let didReceiveResponse = false;
-    const searchMode = resolveSearchModeForPrompt(content);
 
     try {
         const response = await fetch(`/api/conversations/${encodeURIComponent(session.id)}/messages`, {
@@ -1910,7 +1918,9 @@ async function sendPrompt() {
                 content,
                 model: session.model || DEFAULT_MODEL,
                 credentialEnvelope: state.copilot.envelope,
-                ...(searchMode ? { searchMode } : {}),
+                tools: CHAT_TOOLS_PAYLOAD,
+                tool_choice: CHAT_TOOL_CHOICE,
+                parallel_tool_calls: false,
             }),
             signal: state.abortController.signal,
         });

@@ -14,6 +14,11 @@ from fastapi import Request
 
 from .copilot_auth import CopilotCredentialSession
 from .copilot_headers import build_copilot_headers
+from .web_search import (
+    WEB_SEARCH_TOOL_NAME,
+    WebSearchClient,
+    format_tool_result_content,
+)
 
 LOGGER = logging.getLogger(__name__)
 class CopilotChatRequestError(Exception):
@@ -24,6 +29,10 @@ class CopilotChatRequestError(Exception):
 
 
 class CopilotChatService:
+    # web_search 등 도구 호출 응답을 받고 다시 모델을 호출하는 사이클의 최대 반복 횟수.
+    # 무한 루프 방지용. 일반적으로 1~2회면 충분하다.
+    MAX_TOOL_CALL_ITERATIONS = 3
+
     def __init__(
         self,
         config_path: Path,
@@ -34,6 +43,7 @@ class CopilotChatService:
         self.model_ids, self.litellm_model_by_id = self._load_model_config()
         self.allowed_model_ids = set(self.model_ids)
         self.stream_timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=30.0)
+        self.search_client = WebSearchClient()
 
     def get_models_payload(self) -> dict[str, list[dict[str, str]]]:
         return {"data": [{"id": model_id} for model_id in self.model_ids]}
@@ -108,50 +118,281 @@ class CopilotChatService:
         tool_choice: Any = None,
         parallel_tool_calls: bool | None = None,
     ) -> AsyncIterator[bytes]:
-        extra_headers = self._build_extra_headers(initiator_messages or messages)
-        stream = None
-        provider_model = self.resolve_litellm_model(model)
+        """LiteLLM 채팅 완성 스트림을 도구 호출 루프로 감싼다.
 
-        kwargs: dict[str, Any] = {
-            "model": provider_model,
-            "messages": messages,
-            "stream": True,
-            "api_key": session.copilot_api_token,
-            "base_url": session.copilot_api_base,
-            "extra_headers": extra_headers,
-            "custom_llm_provider": "openai",
-            "timeout": self.stream_timeout,
-        }
-        if tools is not None:
-            kwargs["tools"] = tools
-        if tool_choice is not None:
-            kwargs["tool_choice"] = tool_choice
-        if parallel_tool_calls is not None:
-            kwargs["parallel_tool_calls"] = parallel_tool_calls
+        - 모델 응답에 tool_calls 가 있으면 서버 측에서 실행 후 다음 라운드에 첨부.
+        - 브라우저로는 텍스트 콘텐츠와 도구 진행 표시(`🔎 ...`)만 흘려보낸다.
+          tool_calls 델타 자체는 외부 SSE 로 노출되지 않는다.
+        - 라운드는 MAX_TOOL_CALL_ITERATIONS 회로 제한.
+        """
+        extra_headers = self._build_extra_headers(initiator_messages or messages)
+        provider_model = self.resolve_litellm_model(model)
+        working_messages: list[dict[str, Any]] = list(messages)
 
         try:
-            stream = await litellm.acompletion(**kwargs)
+            for _iteration in range(self.MAX_TOOL_CALL_ITERATIONS):
+                kwargs: dict[str, Any] = {
+                    "model": provider_model,
+                    "messages": working_messages,
+                    "stream": True,
+                    "api_key": session.copilot_api_token,
+                    "base_url": session.copilot_api_base,
+                    "extra_headers": extra_headers,
+                    "custom_llm_provider": "openai",
+                    "timeout": self.stream_timeout,
+                }
+                if tools is not None:
+                    kwargs["tools"] = tools
+                if tool_choice is not None:
+                    kwargs["tool_choice"] = tool_choice
+                if parallel_tool_calls is not None:
+                    kwargs["parallel_tool_calls"] = parallel_tool_calls
 
-            async for chunk in stream:
-                if await request.is_disconnected():
-                    break
+                stream = None
+                tool_call_accumulator: dict[int, dict[str, Any]] = {}
+                emitted_error = False
+                client_disconnected = False
 
-                payload, should_stop = self._sanitize_stream_chunk(chunk)
-                if payload is None:
-                    continue
+                try:
+                    stream = await litellm.acompletion(**kwargs)
 
-                yield self._format_sse(payload)
-                if should_stop:
-                    break
-        except Exception as e:
-            self._log_stream_failure(e)
-            yield self._format_sse(self._stream_error_payload(e))
+                    async for chunk in stream:
+                        if await request.is_disconnected():
+                            client_disconnected = True
+                            break
+
+                        raw_payload = self._normalize_stream_chunk(chunk)
+                        if self._is_error_like_stream_payload(raw_payload):
+                            yield self._format_sse(self._stream_error_payload())
+                            emitted_error = True
+                            break
+
+                        self._accumulate_tool_call_deltas(raw_payload, tool_call_accumulator)
+
+                        visible_payload = self._extract_visible_text_payload(raw_payload)
+                        if visible_payload is not None:
+                            yield self._format_sse(visible_payload)
+                finally:
+                    if stream is not None:
+                        close_method = getattr(stream, "aclose", None)
+                        if callable(close_method):
+                            await close_method()
+
+                if emitted_error or client_disconnected:
+                    return
+
+                if not tool_call_accumulator:
+                    return
+
+                finalized_tool_calls = self._finalize_tool_calls(tool_call_accumulator)
+                if not finalized_tool_calls:
+                    return
+
+                working_messages = working_messages + [
+                    {"role": "assistant", "content": None, "tool_calls": finalized_tool_calls}
+                ]
+
+                for tool_call in finalized_tool_calls:
+                    status_payload = self._tool_status_payload(tool_call)
+                    if status_payload is not None:
+                        yield self._format_sse(status_payload)
+                    tool_message = await self._execute_tool_call(tool_call)
+                    working_messages.append(tool_message)
+
+            LOGGER.warning(
+                "Tool-call loop reached max iterations (%d) without final answer",
+                self.MAX_TOOL_CALL_ITERATIONS,
+            )
+            yield self._format_sse(self._stream_error_payload())
+        except Exception as exc:
+            self._log_stream_failure(exc)
+            yield self._format_sse(self._stream_error_payload(exc))
         finally:
-            if stream is not None:
-                close_method = getattr(stream, "aclose", None)
-                if callable(close_method):
-                    await close_method()
             yield b"data: [DONE]\n\n"
+
+    # ------------------------------------------------------------------
+    # 도구 호출 누적/실행 헬퍼
+    # ------------------------------------------------------------------
+
+    def _accumulate_tool_call_deltas(
+        self,
+        payload: dict[str, Any],
+        accumulator: dict[int, dict[str, Any]],
+    ) -> None:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return
+        delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else choice.get("message")
+        if not isinstance(delta, dict):
+            return
+        tool_calls = delta.get("tool_calls")
+        if not isinstance(tool_calls, list):
+            return
+
+        for entry in tool_calls:
+            if not isinstance(entry, dict):
+                continue
+            index = entry.get("index")
+            if not isinstance(index, int):
+                continue
+            slot = accumulator.setdefault(
+                index,
+                {"id": None, "type": "function", "function": {"name": "", "arguments": ""}},
+            )
+            if isinstance(entry.get("id"), str) and entry["id"]:
+                slot["id"] = entry["id"]
+            if isinstance(entry.get("type"), str) and entry["type"]:
+                slot["type"] = entry["type"]
+            function_part = entry.get("function")
+            if isinstance(function_part, dict):
+                name_part = function_part.get("name")
+                # OpenAI 스트림에서 function.name 은 보통 첫 청크에서만 옴.
+                # 이미 채워진 경우 덮어쓰지 않는다.
+                if isinstance(name_part, str) and name_part and not slot["function"].get("name"):
+                    slot["function"]["name"] = name_part
+                arguments_part = function_part.get("arguments")
+                if isinstance(arguments_part, str):
+                    slot["function"]["arguments"] = (slot["function"].get("arguments") or "") + arguments_part
+
+    def _finalize_tool_calls(self, accumulator: dict[int, dict[str, Any]]) -> list[dict[str, Any]]:
+        finalized: list[dict[str, Any]] = []
+        for index in sorted(accumulator.keys()):
+            slot = accumulator[index]
+            function_part = slot.get("function") or {}
+            name = function_part.get("name") or ""
+            if not name:
+                continue
+            finalized.append({
+                "id": slot.get("id") or f"call_{index}",
+                "type": slot.get("type") or "function",
+                "function": {
+                    "name": name,
+                    "arguments": function_part.get("arguments") or "",
+                },
+            })
+        return finalized
+
+    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        function_part = tool_call.get("function") or {}
+        name = function_part.get("name") or ""
+        arguments_raw = function_part.get("arguments") or ""
+        call_id = tool_call.get("id") or ""
+
+        if name != WEB_SEARCH_TOOL_NAME:
+            return self._tool_result_message(
+                call_id,
+                name,
+                {"error": f"Unsupported tool: {name}"},
+            )
+
+        query = self._extract_search_query(arguments_raw)
+        if not query:
+            return self._tool_result_message(
+                call_id,
+                name,
+                {"error": "Missing or invalid 'query' argument."},
+            )
+
+        try:
+            results = await self.search_client.search(query)
+        except Exception as exc:
+            LOGGER.warning(
+                "Tool call '%s' raised %s; returning sanitized error to model",
+                name,
+                type(exc).__name__,
+                exc_info=exc,
+            )
+            return self._tool_result_message(
+                call_id,
+                name,
+                {"query": query, "error": "Web search provider unavailable."},
+            )
+
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": name,
+            "content": format_tool_result_content(query, results),
+        }
+
+    def _tool_result_message(
+        self,
+        call_id: str,
+        name: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": name,
+            "content": json.dumps(payload, ensure_ascii=False),
+        }
+
+    def _extract_search_query(self, arguments_raw: str) -> str:
+        if not arguments_raw:
+            return ""
+        try:
+            parsed = json.loads(arguments_raw)
+        except json.JSONDecodeError:
+            return ""
+        if not isinstance(parsed, dict):
+            return ""
+        query = parsed.get("query")
+        if isinstance(query, str):
+            stripped = query.strip()
+            if stripped:
+                return stripped
+        return ""
+
+    def _tool_status_payload(self, tool_call: dict[str, Any]) -> dict[str, Any] | None:
+        function_part = tool_call.get("function") or {}
+        if function_part.get("name") != WEB_SEARCH_TOOL_NAME:
+            return None
+        query = self._extract_search_query(function_part.get("arguments") or "")
+        if not query:
+            return None
+        return {
+            "choices": [
+                {"delta": {"content": f"\n_🔎 웹 검색 중: {query}_\n\n"}}
+            ]
+        }
+
+    def _extract_visible_text_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        """LiteLLM 청크에서 사용자에게 노출할 텍스트 부분만 추출.
+
+        tool_calls 델타는 의도적으로 제외한다 (내부 누적기에서 따로 처리).
+        """
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices:
+            return None
+
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            return None
+
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            delta = choice.get("message")
+        if not isinstance(delta, dict):
+            return None
+
+        result_delta: dict[str, Any] = {}
+
+        content = self._coerce_stream_content_to_text(delta.get("content"))
+        if content:
+            result_delta["content"] = content
+
+        reasoning_content = delta.get("reasoning_content")
+        if isinstance(reasoning_content, str) and reasoning_content:
+            result_delta["reasoning_content"] = reasoning_content
+
+        if not result_delta:
+            return None
+
+        return {"choices": [{"delta": result_delta}]}
 
     def _log_stream_failure(self, exc: Exception) -> None:
         error_code = self._stream_error_payload(exc)["code"]
@@ -229,16 +470,6 @@ class CopilotChatService:
                 return {"choices": [{"delta": {"content": chunk}}]}
         return {"choices": [{"delta": {"content": str(chunk)}}]}
 
-    def _sanitize_stream_chunk(self, chunk: Any) -> tuple[dict[str, Any] | None, bool]:
-        payload = self._normalize_stream_chunk(chunk)
-        if self._is_error_like_stream_payload(payload):
-            return self._stream_error_payload(), True
-
-        safe_payload = self._extract_text_stream_payload(payload)
-        if safe_payload is None:
-            return None, False
-        return safe_payload, False
-
     def _is_error_like_stream_payload(self, payload: dict[str, Any]) -> bool:
         if "error" in payload or "detail" in payload:
             return True
@@ -256,40 +487,6 @@ class CopilotChatService:
                 return True
 
         return False
-
-    def _extract_text_stream_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not choices:
-            return None
-
-        choice = choices[0]
-        if not isinstance(choice, dict):
-            return None
-
-        delta = choice.get("delta")
-        if not isinstance(delta, dict):
-            delta = choice.get("message")
-        if not isinstance(delta, dict):
-            return None
-
-        result_delta: dict[str, Any] = {}
-
-        content = self._coerce_stream_content_to_text(delta.get("content"))
-        if content:
-            result_delta["content"] = content
-
-        reasoning_content = delta.get("reasoning_content")
-        if isinstance(reasoning_content, str) and reasoning_content:
-            result_delta["reasoning_content"] = reasoning_content
-
-        tool_calls = delta.get("tool_calls")
-        if isinstance(tool_calls, list) and tool_calls:
-            result_delta["tool_calls"] = tool_calls
-
-        if not result_delta:
-            return None
-
-        return {"choices": [{"delta": result_delta}]}
 
     def _coerce_stream_content_to_text(self, content: Any) -> str:
         if isinstance(content, str):
