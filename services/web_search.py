@@ -20,7 +20,7 @@
    으로 감지하고 그 경우 빈 결과로 처리하여 fallback 엔진(html 엔드포인트)으로
    넘긴다.
 
-추가로 연속 호출은 1초 cooldown 으로 throttle 하여 봇 점수 누적을 막는다.
+추가로 연속 호출은 2초 cooldown 으로 throttle 하여 봇 점수 누적을 막는다.
 """
 
 from __future__ import annotations
@@ -104,7 +104,7 @@ class WebSearchClient:
       `format_tool_result_content` 의 명확한 note 와 함께 모델에 전달한다.
     """
 
-    MIN_INTERVAL_SECONDS = 1.0
+    MIN_INTERVAL_SECONDS = 2.0
 
     def __init__(self, *, max_results: int = 5) -> None:
         self.max_results = max_results
