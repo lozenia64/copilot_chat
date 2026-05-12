@@ -5,3 +5,4 @@ python-dotenv
 cryptography
 litellm
 PyYAML
+tavily-python
