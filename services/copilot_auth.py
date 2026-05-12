@@ -1371,8 +1371,12 @@ class CopilotAuthService:
         total_chat = self._normalize_usage_total_value(
             self._coerce_usage_number(monthly_quotas.get("chat"))
         )
-        used_chat: int | None = None
-        if isinstance(remaining_chat, int) and isinstance(total_chat, int) and total_chat >= remaining_chat:
+        used_chat: int | float | None = None
+        if (
+            isinstance(remaining_chat, (int, float))
+            and isinstance(total_chat, (int, float))
+            and total_chat >= remaining_chat
+        ):
             used_chat = total_chat - remaining_chat
 
         chat_payload = {
@@ -1477,8 +1481,12 @@ class CopilotAuthService:
         total = self._normalize_usage_total_value(
             self._coerce_usage_number(raw_metric.get("entitlement"))
         )
-        used: int | None = None
-        if isinstance(remaining, int) and isinstance(total, int) and total >= remaining:
+        used: int | float | None = None
+        if (
+            isinstance(remaining, (int, float))
+            and isinstance(total, (int, float))
+            and total >= remaining
+        ):
             used = total - remaining
 
         has_quota_basis = remaining is not None or total is not None or used is not None
@@ -1547,13 +1555,13 @@ class CopilotAuthService:
         remaining = metric.get("remaining")
         used = metric.get("used")
         total = metric.get("total")
-        if isinstance(total, int) and total <= 0:
+        if isinstance(total, (int, float)) and total <= 0:
             total = None
             metric = {
                 **metric,
                 "total": None,
             }
-        if not isinstance(remaining, int) or used is not None or total is not None:
+        if not isinstance(remaining, (int, float)) or used is not None or total is not None:
             return metric
 
         if remaining < 0 or remaining > 100:
@@ -1565,15 +1573,15 @@ class CopilotAuthService:
             "total": 100,
         }
 
-    def _normalize_usage_basis_value(self, value: int | None) -> int | None:
-        if not isinstance(value, int):
+    def _normalize_usage_basis_value(self, value: int | float | None) -> int | float | None:
+        if not isinstance(value, (int, float)):
             return None
         if value < 0:
             return None
         return value
 
-    def _normalize_usage_total_value(self, value: int | None) -> int | None:
-        if not isinstance(value, int):
+    def _normalize_usage_total_value(self, value: int | float | None) -> int | float | None:
+        if not isinstance(value, (int, float)):
             return None
         if value <= 0:
             return None
@@ -1599,9 +1607,9 @@ class CopilotAuthService:
         aliases: tuple[tuple[str, ...], ...],
         preferred_tokens: set[str],
         disallowed_tokens: set[str],
-    ) -> int | None:
+    ) -> int | float | None:
         best_score = 0
-        best_value: int | None = None
+        best_value: int | float | None = None
 
         for path, numeric_value in self._iter_numeric_paths(payload):
             score = self._score_usage_path(
@@ -1650,7 +1658,7 @@ class CopilotAuthService:
         self,
         value: Any,
         path: tuple[str, ...] = (),
-    ) -> Iterator[tuple[tuple[str, ...], int]]:
+    ) -> Iterator[tuple[tuple[str, ...], int | float]]:
         if isinstance(value, dict):
             for key, nested_value in value.items():
                 yield from self._iter_numeric_paths(nested_value, path + (str(key),))
@@ -1723,7 +1731,7 @@ class CopilotAuthService:
             )
         return tokens
 
-    def _coerce_usage_number(self, value: Any) -> int | None:
+    def _coerce_usage_number(self, value: Any) -> int | float | None:
         if isinstance(value, bool):
             return None
         if isinstance(value, int):
@@ -1731,12 +1739,13 @@ class CopilotAuthService:
         if isinstance(value, float):
             if value < 0:
                 return None
-            return int(value)
+            return value
         if isinstance(value, str):
             text = value.strip()
-            if not text or not re.fullmatch(r"\d+(?:\.0+)?", text):
+            if not text or not re.fullmatch(r"\d+(?:\.\d+)?", text):
                 return None
-            return int(float(text))
+            numeric_value = float(text)
+            return int(numeric_value) if numeric_value.is_integer() else numeric_value
         return None
 
     def _coerce_usage_text(self, value: Any) -> str | None:

@@ -1136,12 +1136,26 @@ function normalizeUsageSnapshot(snapshot) {
     };
 }
 
-function formatUsageCount(value) {
+function formatUsageCount(value, { minimumFractionDigits = 0, maximumFractionDigits = 2 } = {}) {
     if (!Number.isFinite(Number(value))) {
         return null;
     }
 
-    return new Intl.NumberFormat("en-US").format(Number(value));
+    return new Intl.NumberFormat("en-US", {
+        minimumFractionDigits,
+        maximumFractionDigits,
+    }).format(Number(value));
+}
+
+function formatUsagePercent(value) {
+    if (!Number.isFinite(Number(value))) {
+        return null;
+    }
+
+    return new Intl.NumberFormat("en-US", {
+        minimumFractionDigits: 2,
+        maximumFractionDigits: 2,
+    }).format(Number(value));
 }
 
 function formatUsageRemaining(metric) {
@@ -1175,7 +1189,7 @@ function resolvePremiumUsagePercent(metric) {
 
     const used = normalizeUsageQuantity(metric?.used);
     if (used !== null) {
-        return Math.round(Math.min(100, Math.max(0, (used / total) * 100)));
+        return Math.min(100, Math.max(0, (used / total) * 100));
     }
 
     const remaining = normalizeUsageQuantity(metric?.remaining);
@@ -1183,15 +1197,19 @@ function resolvePremiumUsagePercent(metric) {
         return null;
     }
 
-    return Math.round(Math.min(100, Math.max(0, ((total - remaining) / total) * 100)));
+    return Math.min(100, Math.max(0, ((total - remaining) / total) * 100));
 }
 
 function getPremiumUsagePresentation(snapshot, metric) {
     const usedPercent = resolvePremiumUsagePercent(metric);
     if (usedPercent !== null) {
+        const formattedPercent = formatUsagePercent(usedPercent) ?? "0.00";
+        const usedText = formatUsageCount(metric?.used);
+        const totalText = formatUsageCount(metric?.total);
+        const usageCountsText = usedText && totalText ? ` (${usedText} / ${totalText})` : "";
         return {
-            primaryValue: `${usedPercent}% 사용`,
-            title: `Premium requests ${usedPercent}% 사용`,
+            primaryValue: `${formattedPercent}% 사용`,
+            title: `Premium requests ${formattedPercent}% 사용${usageCountsText}`,
             usedPercent,
         };
     }
@@ -1339,7 +1357,7 @@ function applyUsageMetricVisual(cardElement, badgeElement, fillElement, metaElem
     cardElement.title = visual.title;
     badgeElement.textContent = visual.badge;
     badgeElement.setAttribute("aria-label", `${metricKey} 상태 ${visual.badge}`);
-    fillElement.style.width = `${Math.round(visual.ratio * 100)}%`;
+    fillElement.style.width = `${Math.max(0, Math.min(100, visual.ratio * 100)).toFixed(2)}%`;
     metaElement.textContent = describeUsageMetric(snapshot, metricKey, metric);
 }
 
