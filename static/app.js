@@ -912,6 +912,10 @@ function syncViewportHeightVar() {
         1,
     );
     document.documentElement.style.setProperty("--app-height", `${viewportHeight}px`);
+
+    if (document.activeElement === elements.promptInput) {
+        scheduleScrollMessagesToBottom(3);
+    }
 }
 
 function getViewportLayout() {
@@ -1012,6 +1016,20 @@ function adjustTextareaHeight() {
 
 function scrollMessagesToBottom() {
     elements.messages.scrollTop = elements.messages.scrollHeight;
+}
+
+function scheduleScrollMessagesToBottom(frameCount = 2) {
+    let remainingFrames = Math.max(frameCount, 1);
+
+    const scrollOnNextFrame = () => {
+        scrollMessagesToBottom();
+        remainingFrames -= 1;
+        if (remainingFrames > 0) {
+            window.requestAnimationFrame(scrollOnNextFrame);
+        }
+    };
+
+    window.requestAnimationFrame(scrollOnNextFrame);
 }
 
 function focusInput() {
@@ -2280,6 +2298,10 @@ function bindEvents() {
     elements.promptInput.addEventListener("input", () => {
         adjustTextareaHeight();
         updateComposerControls();
+    });
+
+    elements.promptInput.addEventListener("focus", () => {
+        scheduleScrollMessagesToBottom(3);
     });
 
     elements.promptInput.addEventListener("keydown", (event) => {
