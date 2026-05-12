@@ -6,3 +6,5 @@ cryptography
 litellm
 PyYAML
 tavily-python
+python-multipart
+Pillow

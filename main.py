@@ -2,20 +2,22 @@ from __future__ import annotations
 
 import logging
 import os
+import secrets
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, File, Form, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from services.copilot_auth import CopilotAuthError, CopilotAuthService
 from services.copilot_chat import CopilotChatRequestError, CopilotChatService
 from services.conversation_service import ConversationService, ConversationStateError
+from services.image_attachment_service import ImageAttachmentError, ImageAttachmentService
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,6 +35,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 auth_service = CopilotAuthService()
 chat_service = CopilotChatService(config_path=CONFIG_PATH, default_model=DEFAULT_MODEL)
 conversation_service = ConversationService()
+image_attachment_service = ImageAttachmentService()
 LOGGER = logging.getLogger("uvicorn.error")
 
 
@@ -100,13 +103,23 @@ class ConversationTitleRequest(BaseModel):
     credentialEnvelope: str | None = None
 
 
+class ConversationAttachmentRef(BaseModel):
+    id: str
+
+
 class ConversationMessageRequest(BaseModel):
-    content: str
+    content: str = ""
+    attachments: list[ConversationAttachmentRef] = Field(default_factory=list)
     model: str | None = None
     credentialEnvelope: str | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any = None
     parallel_tool_calls: bool | None = None
+
+
+class AttachmentDeleteRequest(BaseModel):
+    conversationId: str
+    credentialEnvelope: str | None = None
 
 
 def _resolve_browser_session_context(request: Request) -> BrowserSessionContext:
@@ -143,6 +156,46 @@ def _build_streaming_response(stream) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _decorate_attachment_urls(payload: dict[str, Any], session_secret: str) -> dict[str, Any]:
+    def decorate_session(session: dict[str, Any]) -> None:
+        conversation_id = session.get("id")
+        messages = session.get("messages")
+        if not isinstance(conversation_id, str) or not isinstance(messages, list):
+            return
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            attachments = message.get("attachments")
+            if not isinstance(attachments, list):
+                continue
+            for attachment in attachments:
+                if not isinstance(attachment, dict):
+                    continue
+                attachment_id = attachment.get("id")
+                if not isinstance(attachment_id, str) or not attachment_id:
+                    continue
+                attachment["contentUrl"] = image_attachment_service.build_attachment_content_url(
+                    session_secret=session_secret,
+                    conversation_id=conversation_id,
+                    attachment_id=attachment_id,
+                )
+
+    sessions = payload.get("sessions")
+    if isinstance(sessions, list):
+        for session in sessions:
+            if isinstance(session, dict):
+                decorate_session(session)
+
+    session = payload.get("session")
+    if isinstance(session, dict):
+        decorate_session(session)
+
+    if isinstance(payload.get("id"), str) and isinstance(payload.get("messages"), list):
+        decorate_session(payload)
+
+    return payload
 
 
 @app.exception_handler(CopilotAuthError)
@@ -187,6 +240,14 @@ async def handle_conversation_state_error(_: Request, exc: ConversationStateErro
     )
 
 
+@app.exception_handler(ImageAttachmentError)
+async def handle_image_attachment_error(_: Request, exc: ImageAttachmentError) -> JSONResponse:
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"message": exc.message, "code": exc.code},
+    )
+
+
 @app.exception_handler(RequestValidationError)
 async def handle_request_validation_error(_: Request, __: RequestValidationError) -> JSONResponse:
     return JSONResponse(
@@ -218,9 +279,10 @@ async def get_models() -> dict[str, list[dict[str, str]]]:
 async def get_conversations(request: Request, response: Response) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
     _apply_browser_session_cookie(response, browser_session)
-    return conversation_service.get_state_payload(
+    payload = conversation_service.get_state_payload(
         auth_service.get_anonymous_history_scope(browser_session.conversation_scope_id)
     )
+    return _decorate_attachment_urls(payload, browser_session.session_secret)
 
 
 @app.post("/api/conversations/state")
@@ -237,7 +299,10 @@ async def get_conversations_state(
         browser_session.conversation_scope_id,
     )
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return conversation_service.get_state_payload(owner_context.scope_id)
+    return _decorate_attachment_urls(
+        conversation_service.get_state_payload(owner_context.scope_id),
+        browser_session.session_secret,
+    )
 
 
 @app.post("/api/conversations")
@@ -257,7 +322,7 @@ async def create_conversation(
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
     return {
-        "session": session,
+        "session": _decorate_attachment_urls(session, browser_session.session_secret),
         "activeSessionId": session["id"],
     }
 
@@ -302,7 +367,7 @@ async def update_conversation_model(
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return {"session": session}
+    return {"session": _decorate_attachment_urls(session, browser_session.session_secret)}
 
 
 @app.post("/api/conversations/{conversation_id}/delete")
@@ -324,7 +389,7 @@ async def delete_conversation(
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return state_payload
+    return _decorate_attachment_urls(state_payload, browser_session.session_secret)
 
 
 @app.post("/api/conversations/{conversation_id}/title")
@@ -348,7 +413,135 @@ async def update_conversation_title(
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return {"session": session}
+    return {"session": _decorate_attachment_urls(session, browser_session.session_secret)}
+
+
+@app.post("/api/uploads/images")
+async def upload_image_attachment(
+    request: Request,
+    response: Response,
+    file: UploadFile | None = File(None),
+    conversationId: str = Form(...),
+    credentialEnvelope: str = Form(...),
+) -> dict[str, Any]:
+    if not credentialEnvelope:
+        raise CopilotAuthError(
+            status_code=401,
+            message="이 브라우저의 GitHub Copilot 자격 정보가 없습니다. 먼저 로그인하세요.",
+            code="copilot_login_required",
+        )
+
+    browser_session = _resolve_browser_session_context(request)
+    copilot_session, refreshed_envelope = await auth_service.resolve_session(
+        credentialEnvelope,
+        browser_session.session_secret,
+    )
+    if file is None:
+        raise ImageAttachmentError(
+            code="attachment_upload_required",
+            message="업로드할 이미지가 없습니다.",
+        )
+    owner_context = auth_service.get_authenticated_history_owner(copilot_session)
+    conversation_service.require_conversation(owner_context.scope_id, conversationId)
+
+    attachment_id = f"att_{secrets.token_urlsafe(12)}"
+    image_bytes = await file.read()
+    stored_image = image_attachment_service.store_uploaded_image(
+        attachment_id=attachment_id,
+        image_bytes=image_bytes,
+        declared_mime_type=file.content_type,
+    )
+    try:
+        attachment = conversation_service.create_attachment(
+            owner_context.scope_id,
+            conversationId,
+            attachment_id=attachment_id,
+            original_filename=file.filename or f"{attachment_id}.jpg",
+            mime_type=stored_image.mime_type,
+            byte_size=stored_image.byte_size,
+            width=stored_image.width,
+            height=stored_image.height,
+            storage_path=stored_image.storage_path,
+        )
+    except Exception:
+        image_attachment_service.delete_uploaded_image(stored_image.storage_path)
+        raise
+
+    attachment["conversationId"] = conversationId
+    attachment["contentUrl"] = image_attachment_service.build_attachment_content_url(
+        session_secret=browser_session.session_secret,
+        conversation_id=conversationId,
+        attachment_id=attachment["id"],
+    )
+    _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return {"attachment": attachment}
+
+
+@app.delete("/api/uploads/images/{attachment_id}")
+async def delete_image_attachment(
+    attachment_id: str,
+    request: Request,
+    response: Response,
+    payload: AttachmentDeleteRequest,
+) -> dict[str, bool]:
+    if not payload.credentialEnvelope:
+        raise CopilotAuthError(
+            status_code=401,
+            message="이 브라우저의 GitHub Copilot 자격 정보가 없습니다. 먼저 로그인하세요.",
+            code="copilot_login_required",
+        )
+
+    browser_session = _resolve_browser_session_context(request)
+    copilot_session, refreshed_envelope = await auth_service.resolve_session(
+        payload.credentialEnvelope,
+        browser_session.session_secret,
+    )
+    owner_context = auth_service.get_authenticated_history_owner(copilot_session)
+    attachment = conversation_service.get_attachment_record(
+        owner_context.scope_id,
+        payload.conversationId,
+        attachment_id,
+    )
+    if attachment["messageId"] is not None:
+        raise ConversationStateError(
+            status_code=409,
+            message="이미 전송에 사용된 첨부 이미지입니다. 다시 업로드하세요.",
+            code="attachment_already_attached",
+        )
+    image_attachment_service.delete_uploaded_image(attachment["storagePath"])
+    conversation_service.delete_pending_attachment(
+        owner_context.scope_id,
+        payload.conversationId,
+        attachment_id,
+    )
+    _apply_browser_session_cookie(response, browser_session)
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return {"deleted": True}
+
+
+@app.get("/api/conversations/{conversation_id}/attachments/{attachment_id}/content")
+async def get_image_attachment_content(
+    conversation_id: str,
+    attachment_id: str,
+    token: str,
+    request: Request,
+):
+    browser_session = _resolve_browser_session_context(request)
+    image_attachment_service.validate_attachment_content_token(
+        session_secret=browser_session.session_secret,
+        conversation_id=conversation_id,
+        attachment_id=attachment_id,
+        token=token,
+    )
+    attachment = conversation_service.get_attachment_record_for_content(conversation_id, attachment_id)
+    response = FileResponse(
+        path=attachment["storagePath"],
+        media_type=attachment["mimeType"],
+        headers={"Cache-Control": "private, max-age=300"},
+    )
+    _apply_browser_session_cookie(response, browser_session)
+    return response
 
 
 @app.post("/api/conversations/{conversation_id}/messages")
@@ -364,8 +557,10 @@ async def send_conversation_message(
             code="copilot_login_required",
         )
 
-    content = conversation_service.validate_message_content(payload.content)
-    model_id = chat_service.resolve_model(payload.model) if payload.model is not None else None
+    content, attachment_ids = conversation_service.validate_message_input(
+        payload.content,
+        [attachment.model_dump() for attachment in payload.attachments],
+    )
 
     browser_session = _resolve_browser_session_context(request)
     copilot_session, refreshed_envelope = await auth_service.resolve_session(
@@ -373,11 +568,20 @@ async def send_conversation_message(
         browser_session.session_secret,
     )
     owner_context = auth_service.get_authenticated_history_owner(copilot_session)
+    conversation_payload = conversation_service.get_conversation_payload(owner_context.scope_id, conversation_id)
+    model_id = chat_service.resolve_model(payload.model or conversation_payload.get("model"))
+    if attachment_ids:
+        chat_service.ensure_model_supports_vision(model_id)
     turn = conversation_service.begin_turn(
         owner_context.scope_id,
         conversation_id,
         content=content,
+        attachment_ids=attachment_ids,
         model=model_id,
+    )
+    provider_messages = chat_service.build_provider_messages(
+        turn.prior_messages,
+        turn.new_user_message,
     )
 
     stream_response = _build_streaming_response(
@@ -389,9 +593,9 @@ async def send_conversation_message(
             stream=chat_service.stream_chat_completion(
                 request=request,
                 model=turn.model,
-                messages=turn.visible_messages,
+                messages=provider_messages,
                 session=copilot_session,
-                initiator_messages=turn.visible_messages,
+                initiator_messages=provider_messages,
                 tools=payload.tools,
                 tool_choice=payload.tool_choice,
                 parallel_tool_calls=payload.parallel_tool_calls,

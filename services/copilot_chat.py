@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
@@ -65,6 +66,44 @@ class CopilotChatService:
     def resolve_litellm_model(self, model: str) -> str:
         return self.litellm_model_by_id.get(model, model)
 
+    def ensure_model_supports_vision(self, model: str) -> None:
+        provider_model = self.resolve_litellm_model(model)
+        try:
+            supports_vision = bool(litellm.supports_vision(model=provider_model))
+        except Exception:
+            supports_vision = False
+        if not supports_vision:
+            raise CopilotChatRequestError(
+                code="chat_model_not_vision_capable",
+                message="선택한 모델은 이미지 첨부를 지원하지 않습니다. 다른 모델을 선택하세요.",
+            )
+
+    def build_provider_messages(
+        self,
+        prior_messages: list[dict[str, Any]],
+        new_user_message: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        provider_messages: list[dict[str, Any]] = []
+
+        for message in prior_messages:
+            if not isinstance(message, dict):
+                continue
+            role = message.get("role")
+            if not isinstance(role, str) or not role.strip():
+                continue
+            content = self._build_history_message_content(message)
+            if not content:
+                continue
+            provider_messages.append({"role": role.strip(), "content": content})
+
+        provider_messages.append(
+            {
+                "role": "user",
+                "content": self._build_current_user_message_content(new_user_message),
+            }
+        )
+        return provider_messages
+
     def validate_chat_request(
         self,
         model: str | None,
@@ -104,6 +143,60 @@ class CopilotChatService:
             normalized_messages.append(normalized_message)
 
         return model_id, normalized_messages
+
+    def _build_history_message_content(self, message: dict[str, Any]) -> str:
+        content_text = self._coerce_message_content_to_text(message.get("content"))
+        attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+        attachment_summary = self._build_attachment_summary_text(attachments)
+        if content_text and attachment_summary:
+            return f"{content_text}\n\n{attachment_summary}"
+        return content_text or attachment_summary
+
+    def _build_current_user_message_content(self, message: dict[str, Any]) -> str | list[dict[str, Any]]:
+        content_text = self._coerce_message_content_to_text(message.get("content"))
+        attachments = message.get("attachments") if isinstance(message.get("attachments"), list) else []
+        if not attachments:
+            return content_text
+
+        parts: list[dict[str, Any]] = []
+        if content_text:
+            parts.append({"type": "text", "text": content_text})
+        for attachment in attachments:
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": self._attachment_to_data_url(attachment)},
+                }
+            )
+        return parts
+
+    def _attachment_to_data_url(self, attachment: dict[str, Any]) -> str:
+        storage_path = attachment.get("storagePath")
+        if not isinstance(storage_path, str) or not storage_path.strip():
+            raise CopilotChatRequestError(
+                code="attachment_not_found",
+                message="첨부 이미지를 찾을 수 없습니다. 다시 업로드하세요.",
+            )
+        path = Path(storage_path)
+        if not path.exists() or not path.is_file():
+            raise CopilotChatRequestError(
+                code="attachment_not_found",
+                message="첨부 이미지를 찾을 수 없습니다. 다시 업로드하세요.",
+            )
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:image/jpeg;base64,{encoded}"
+
+    def _build_attachment_summary_text(self, attachments: list[dict[str, Any]]) -> str:
+        if not attachments:
+            return ""
+        file_names = [
+            str(attachment.get("fileName")).strip()
+            for attachment in attachments
+            if isinstance(attachment, dict) and isinstance(attachment.get("fileName"), str) and attachment.get("fileName").strip()
+        ]
+        if not file_names:
+            return f"[사용자가 이미지 {len(attachments)}개를 첨부함]"
+        return f"[사용자가 이미지 {len(attachments)}개를 첨부함: {', '.join(file_names)}]"
 
 
 

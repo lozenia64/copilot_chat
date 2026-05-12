@@ -2,10 +2,18 @@ const DEFAULT_MODEL = window.APP_CONFIG?.defaultModel ?? "gpt-5.4";
 const CREDENTIAL_STORAGE_KEY = window.APP_CONFIG?.credentialStorageKey ?? "copilotCredentialEnvelope";
 const SERVER_ERROR_MESSAGES = Object.freeze({
     conversation_message_required: "보낼 메시지를 입력하세요.",
+    conversation_attachments_invalid: "첨부 이미지 형식이 올바르지 않습니다.",
+    conversation_attachments_limit_exceeded: "이미지는 한 번에 최대 5개까지 전송할 수 있습니다.",
     conversation_not_found: "대화 세션을 찾을 수 없습니다. 새 대화를 시작하세요.",
     conversation_title_required: "대화 제목을 입력하세요.",
+    attachment_already_attached: "이미 전송에 사용된 첨부 이미지입니다. 다시 업로드하세요.",
+    attachment_decode_failed: "이미지 파일을 처리할 수 없습니다. 다른 파일을 선택하세요.",
+    attachment_file_too_large: "이미지 1개당 5MB 이하 업로드만 허용됩니다.",
+    attachment_image_only: "이미지 파일만 첨부할 수 있습니다.",
+    attachment_not_found: "첨부 이미지를 찾을 수 없습니다. 다시 업로드하세요.",
     chat_messages_invalid: "채팅 메시지 형식이 올바르지 않습니다. 다시 시도하세요.",
     chat_model_not_allowed: "선택한 모델은 사용할 수 없습니다. 목록에서 다시 선택하세요.",
+    chat_model_not_vision_capable: "선택한 모델은 이미지 첨부를 지원하지 않습니다. 다른 모델을 선택하세요.",
     chat_model_required: "채팅 모델을 확인할 수 없습니다. 다시 시도하세요.",
     copilot_access_token_failed: "GitHub 인증을 완료하지 못했습니다. 다시 시도하세요.",
     copilot_access_token_missing: "GitHub 액세스 토큰을 가져오지 못했습니다.",
@@ -47,6 +55,15 @@ const MOBILE_VIEWPORT_MAX_WIDTH = 960;
 const COMPACT_VIEWPORT_MAX_HEIGHT = 720;
 const SIDEBAR_OVERLAY_HIDE_DELAY_MS = 180;
 const SIDEBAR_COLLAPSE_STORAGE_KEY = "localChatSidebarCollapsed";
+const MAX_ATTACHMENTS_PER_MESSAGE = 5;
+const MAX_ORIGINAL_IMAGE_BYTES = 15 * 1024 * 1024;
+const TARGET_COMPRESSED_IMAGE_BYTES = 5 * 1024 * 1024;
+const INITIAL_IMAGE_MAX_DIMENSION = 2048;
+const SECONDARY_IMAGE_MAX_DIMENSION = 1600;
+const INITIAL_JPEG_QUALITY = 0.86;
+const MIN_JPEG_QUALITY = 0.55;
+const JPEG_QUALITY_STEP = 0.08;
+const COMPOSER_ATTACHMENT_BUSY_STATES = new Set(["compressing", "uploading"]);
 // 매 채팅 요청에 함께 보내는 OpenAI 형식의 web_search function tool 스펙.
 // 사용자가 명시적으로 "검색해줘" 라고 말하지 않더라도, 모델이 최신 정보·실시간
 // 데이터·외부 출처가 필요하다고 판단하면 자동으로 이 도구를 호출한다. 실제 검색
@@ -138,6 +155,7 @@ const state = {
         ephemeralSecret: false,
         usage: createEmptyUsageSnapshot(),
     },
+    composerAttachments: [],
 };
 
 const elements = {
@@ -146,6 +164,10 @@ const elements = {
     messages: document.getElementById("messages"),
     newChatButton: document.getElementById("newChatButton"),
     composerForm: document.getElementById("composerForm"),
+    composerDropzone: document.getElementById("composerDropzone"),
+    composerAttachmentList: document.getElementById("composerAttachmentList"),
+    attachmentInput: document.getElementById("attachmentInput"),
+    attachmentButton: document.getElementById("attachmentButton"),
     promptInput: document.getElementById("promptInput"),
     sendButton: document.getElementById("sendButton"),
     sendButtonText: document.getElementById("sendButtonText"),
@@ -207,11 +229,37 @@ function persistCredentialEnvelope(envelope) {
     window.localStorage.removeItem(CREDENTIAL_STORAGE_KEY);
 }
 
+function handleUnauthorizedCopilot(message, options = {}) {
+    const shouldClearComposerAttachments = Boolean(options.clearComposerAttachments);
+    persistCredentialEnvelope("");
+    state.copilot.status = "disconnected";
+    state.copilot.errorMessage = message;
+    resetUsageSnapshot("not_authenticated");
+    if (shouldClearComposerAttachments) {
+        clearComposerAttachments();
+    }
+    openAuthModal();
+    renderAuthState();
+}
+
+function normalizeServerAttachment(attachment) {
+    return {
+        id: typeof attachment?.id === "string" && attachment.id ? attachment.id : createId("attachment"),
+        fileName: typeof attachment?.fileName === "string" && attachment.fileName ? attachment.fileName : "image.jpg",
+        mimeType: typeof attachment?.mimeType === "string" && attachment.mimeType ? attachment.mimeType : "image/jpeg",
+        byteSize: Number.isFinite(Number(attachment?.byteSize)) ? Number(attachment.byteSize) : 0,
+        width: Number.isFinite(Number(attachment?.width)) ? Number(attachment.width) : null,
+        height: Number.isFinite(Number(attachment?.height)) ? Number(attachment.height) : null,
+        contentUrl: typeof attachment?.contentUrl === "string" ? attachment.contentUrl : "",
+    };
+}
+
 function normalizeServerMessage(message) {
     return {
         id: typeof message?.id === "string" && message.id ? message.id : createId("message"),
         role: typeof message?.role === "string" && message.role ? message.role : "assistant",
         content: typeof message?.content === "string" ? message.content : "",
+        attachments: Array.isArray(message?.attachments) ? message.attachments.map(normalizeServerAttachment) : [],
         status: typeof message?.status === "string" && message.status ? message.status : "complete",
         createdAt: Number.isFinite(Number(message?.createdAt)) ? Number(message.createdAt) : Date.now(),
         updatedAt: Number.isFinite(Number(message?.updatedAt)) ? Number(message.updatedAt) : Date.now(),
@@ -304,6 +352,20 @@ function clearConversationState() {
     populateModelOptions();
 }
 
+function summarizeMessageForSidebar(message) {
+    const content = typeof message?.content === "string" ? message.content.trim() : "";
+    if (content) {
+        return truncateText(content.replace(/\s+/g, " "), 60);
+    }
+
+    const attachmentCount = Array.isArray(message?.attachments) ? message.attachments.length : 0;
+    if (attachmentCount > 0) {
+        return attachmentCount === 1 ? "이미지 1개" : `이미지 ${attachmentCount}개`;
+    }
+
+    return "대화를 시작해 보세요.";
+}
+
 async function persistSessionModel(sessionId, modelId, previousModel) {
     const session = state.sessions.find((item) => item.id === sessionId);
     if (!session) {
@@ -383,10 +445,20 @@ function truncateText(text, limit = 42) {
 
 function updateSessionTitle(session) {
     const firstUserMessage = session.messages.find(
-        (message) => message.role === "user" && message.content.trim(),
+        (message) => message.role === "user" && (message.content.trim() || message.attachments?.length),
     );
+    if (!firstUserMessage) {
+        session.title = "새 대화";
+        return;
+    }
 
-    session.title = firstUserMessage ? truncateText(firstUserMessage.content.replace(/\s+/g, " ")) : "새 대화";
+    if (firstUserMessage.content.trim()) {
+        session.title = truncateText(firstUserMessage.content.replace(/\s+/g, " "));
+        return;
+    }
+
+    const attachmentCount = Array.isArray(firstUserMessage.attachments) ? firstUserMessage.attachments.length : 0;
+    session.title = attachmentCount > 0 ? `이미지 ${attachmentCount}개` : "새 대화";
 }
 
 function promoteSession(sessionId) {
@@ -400,6 +472,13 @@ function promoteSession(sessionId) {
 }
 
 async function createSession({ focus = true, silent = false } = {}) {
+    if (state.composerAttachments.length > 0) {
+        if (!silent) {
+            showToast("첨부한 이미지를 먼저 전송하거나 삭제하세요.", "info");
+        }
+        return getActiveSession();
+    }
+
     const currentSession = getActiveSession();
 
     try {
@@ -435,6 +514,11 @@ async function createSession({ focus = true, silent = false } = {}) {
 async function selectSession(sessionId) {
     const session = state.sessions.find((item) => item.id === sessionId);
     if (!session) {
+        return;
+    }
+
+    if (state.composerAttachments.length > 0 && state.activeSessionId !== sessionId) {
+        showToast("첨부한 이미지를 먼저 전송하거나 삭제하세요.", "info");
         return;
     }
 
@@ -487,7 +571,7 @@ function renderSidebar() {
         const preview = document.createElement("span");
         preview.className = "session-preview";
         const lastMessage = session.messages.at(-1);
-        preview.textContent = lastMessage ? truncateText(lastMessage.content.replace(/\s+/g, " "), 60) : "대화를 시작해 보세요.";
+        preview.textContent = lastMessage ? summarizeMessageForSidebar(lastMessage) : "대화를 시작해 보세요.";
 
         button.append(abbreviation, title, preview);
         button.addEventListener("click", () => {
@@ -699,6 +783,63 @@ function renderMessages() {
     scrollMessagesToBottom();
 }
 
+function renderMessageAttachments(container, attachments) {
+    if (!Array.isArray(attachments) || attachments.length === 0) {
+        return;
+    }
+
+    const grid = document.createElement("div");
+    grid.className = "message-attachments";
+
+    attachments.forEach((attachment) => {
+        if (!attachment?.contentUrl) {
+            return;
+        }
+
+        const tile = document.createElement("div");
+        tile.className = "message-attachment-tile";
+
+        const image = document.createElement("img");
+        image.className = "message-attachment-image";
+        image.src = attachment.contentUrl;
+        image.alt = attachment.fileName || "첨부 이미지";
+        image.loading = "lazy";
+        image.addEventListener("error", () => {
+            void syncConversationStateSilently();
+        }, { once: true });
+
+        const label = document.createElement("span");
+        label.className = "message-attachment-label";
+        label.textContent = attachment.fileName || "image.jpg";
+
+        tile.append(image, label);
+        grid.appendChild(tile);
+    });
+
+    if (grid.childElementCount > 0) {
+        container.appendChild(grid);
+    }
+}
+
+function renderMessageBody(container, message) {
+    container.innerHTML = "";
+    renderMessageAttachments(container, message.attachments);
+
+    if (message.content) {
+        renderMarkdownInto(container, message.content);
+        return;
+    }
+
+    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
+        return;
+    }
+
+    const pending = document.createElement("span");
+    pending.className = "pending-text";
+    pending.textContent = state.isStreaming && message.role === "assistant" ? "생성 중" : "";
+    container.appendChild(pending);
+}
+
 function createMessageElement(message) {
     const article = document.createElement("article");
     article.className = `message message-${message.role}`;
@@ -707,14 +848,7 @@ function createMessageElement(message) {
     const body = document.createElement("div");
     body.className = "message-body";
 
-    if (!message.content) {
-        const pending = document.createElement("span");
-        pending.className = "pending-text";
-        pending.textContent = state.isStreaming && message.role === "assistant" ? "생성 중" : "";
-        body.appendChild(pending);
-    } else {
-        renderMarkdownInto(body, message.content);
-    }
+    renderMessageBody(body, message);
 
     article.appendChild(body);
     return article;
@@ -731,7 +865,7 @@ function updateMessageContent(message) {
         return;
     }
 
-    renderMarkdownInto(body, message.content);
+    renderMessageBody(body, message);
     scrollMessagesToBottom();
 }
 
@@ -848,12 +982,632 @@ function renderMarkdownInto(container, content) {
     container.appendChild(fragment);
 }
 
+function formatByteSize(byteSize) {
+    if (!Number.isFinite(byteSize) || byteSize <= 0) {
+        return "0B";
+    }
+    if (byteSize < 1024) {
+        return `${byteSize}B`;
+    }
+    if (byteSize < 1024 * 1024) {
+        return `${(byteSize / 1024).toFixed(1)}KB`;
+    }
+    return `${(byteSize / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function replaceFileExtensionWithJpg(fileName) {
+    if (typeof fileName !== "string" || !fileName.trim()) {
+        return "image.jpg";
+    }
+    return fileName.replace(/\.[^.]+$/, "") + ".jpg";
+}
+
+function getComposerAttachmentByLocalId(localId) {
+    return state.composerAttachments.find((attachment) => attachment.localId === localId) ?? null;
+}
+
+function buildUploadedAttachmentPayload() {
+    return state.composerAttachments
+        .filter((attachment) => attachment.status === "uploaded" && attachment.attachmentId)
+        .map((attachment) => ({ id: attachment.attachmentId }));
+}
+
+function buildOptimisticAttachmentPayload() {
+    return state.composerAttachments
+        .filter((attachment) => attachment.status === "uploaded" && attachment.attachmentId)
+        .map((attachment) => ({
+            id: attachment.attachmentId,
+            fileName: attachment.fileName,
+            mimeType: attachment.mimeType || "image/jpeg",
+            byteSize: attachment.compressedByteSize || 0,
+            width: attachment.width,
+            height: attachment.height,
+            contentUrl: attachment.contentUrl || attachment.previewObjectUrl || "",
+        }));
+}
+
+function cleanupComposerAttachmentObjectUrls(attachments = state.composerAttachments) {
+    attachments.forEach((attachment) => {
+        if (attachment?.previewObjectUrl) {
+            URL.revokeObjectURL(attachment.previewObjectUrl);
+            attachment.previewObjectUrl = null;
+        }
+    });
+}
+
+function clearComposerAttachments() {
+    cleanupComposerAttachmentObjectUrls();
+    state.composerAttachments = [];
+    if (elements.attachmentInput) {
+        elements.attachmentInput.value = "";
+    }
+    renderComposerAttachments();
+    updateComposerControls();
+}
+
+function validateSelectedImageFiles(files) {
+    if (!Array.isArray(files) || files.length === 0) {
+        return "업로드할 이미지가 없습니다.";
+    }
+    if (state.composerAttachments.length + files.length > MAX_ATTACHMENTS_PER_MESSAGE) {
+        return "이미지는 한 번에 최대 5개까지 첨부할 수 있습니다.";
+    }
+    for (const file of files) {
+        if (!(file instanceof File) || !file.type.startsWith("image/")) {
+            return "이미지 파일만 첨부할 수 있습니다.";
+        }
+        if (file.size > MAX_ORIGINAL_IMAGE_BYTES) {
+            return "이미지 1개당 15MB 이하만 첨부할 수 있습니다.";
+        }
+    }
+    return null;
+}
+
+async function ensureSessionBeforeAttachmentUpload() {
+    const hasCredentials = await ensureCopilotCredentials({ interactive: true });
+    if (!hasCredentials) {
+        focusInput();
+        return null;
+    }
+    const session = await ensureConversationSession();
+    if (!session) {
+        focusInput();
+        return null;
+    }
+    return session;
+}
+
+function openAttachmentPicker() {
+    if (state.isStreaming) {
+        return;
+    }
+    elements.attachmentInput?.click();
+}
+
+async function handleAttachmentInputChange(event) {
+    const fileList = Array.from(event.target?.files || []);
+    event.target.value = "";
+    await queueSelectedFiles(fileList);
+}
+
+function hasImageFilesInDataTransfer(dataTransfer) {
+    if (!dataTransfer) {
+        return false;
+    }
+
+    if (dataTransfer.items && dataTransfer.items.length > 0) {
+        return Array.from(dataTransfer.items).some((item) => item.kind === "file" && item.type.startsWith("image/"));
+    }
+
+    if (dataTransfer.files && dataTransfer.files.length > 0) {
+        return Array.from(dataTransfer.files).some((file) => file.type.startsWith("image/"));
+    }
+
+    return false;
+}
+
+function handleComposerDragOver(event) {
+    event.preventDefault();
+    if (hasImageFilesInDataTransfer(event.dataTransfer)) {
+        elements.composerDropzone?.classList.add("dragover");
+    } else {
+        elements.composerDropzone?.classList.remove("dragover");
+    }
+}
+
+function handleComposerDragEnter(event) {
+    event.preventDefault();
+    if (hasImageFilesInDataTransfer(event.dataTransfer)) {
+        elements.composerDropzone?.classList.add("dragover");
+    }
+}
+
+function handleComposerDragLeave(event) {
+    if (event.currentTarget === event.target) {
+        elements.composerDropzone?.classList.remove("dragover");
+    }
+}
+
+async function handleComposerDrop(event) {
+    event.preventDefault();
+    elements.composerDropzone?.classList.remove("dragover");
+    await queueSelectedFiles(event.dataTransfer?.files);
+}
+
+function createComposerAttachmentItem(file) {
+    return {
+        localId: createId("attachment"),
+        fileName: file.name,
+        originalFile: file,
+        compressedFile: null,
+        previewObjectUrl: null,
+        status: "queued",
+        errorMessage: null,
+        originalByteSize: file.size,
+        compressedByteSize: null,
+        mimeType: null,
+        width: null,
+        height: null,
+        attachmentId: null,
+        contentUrl: null,
+    };
+}
+
+function describeComposerAttachmentStatus(attachment) {
+    const sizeLabel = attachment.compressedByteSize ? ` · ${formatByteSize(attachment.compressedByteSize)}` : "";
+    switch (attachment.status) {
+        case "queued":
+            return "대기 중";
+        case "compressing":
+            return "압축 중";
+        case "ready_to_upload":
+            return `업로드 준비${sizeLabel}`;
+        case "uploading":
+            return "업로드 중";
+        case "uploaded":
+            return `업로드 완료${sizeLabel}`;
+        case "failed":
+            return attachment.errorMessage || "업로드 실패";
+        default:
+            return "대기 중";
+    }
+}
+
+function renderComposerAttachments() {
+    if (!elements.composerAttachmentList) {
+        return;
+    }
+    elements.composerAttachmentList.innerHTML = "";
+
+    const fragment = document.createDocumentFragment();
+    state.composerAttachments.forEach((attachment) => {
+        const item = document.createElement("div");
+        item.className = "composer-attachment-item";
+
+        let thumb;
+        if (attachment.previewObjectUrl) {
+            thumb = document.createElement("img");
+            thumb.className = "composer-attachment-thumb";
+            thumb.src = attachment.previewObjectUrl;
+            thumb.alt = attachment.fileName;
+        } else {
+            thumb = document.createElement("div");
+            thumb.className = "composer-attachment-thumb";
+        }
+
+        const meta = document.createElement("div");
+        meta.className = "composer-attachment-meta";
+
+        const name = document.createElement("span");
+        name.className = "composer-attachment-name";
+        name.textContent = attachment.fileName;
+
+        const status = document.createElement("span");
+        status.className = `composer-attachment-status${attachment.status === "failed" ? " error" : ""}`;
+        status.textContent = describeComposerAttachmentStatus(attachment);
+
+        meta.append(name, status);
+
+        const actions = document.createElement("div");
+        actions.className = "composer-attachment-actions";
+
+        if (attachment.status === "failed") {
+            const retryButton = document.createElement("button");
+            retryButton.type = "button";
+            retryButton.className = "composer-attachment-retry";
+            retryButton.textContent = "재시도";
+            retryButton.addEventListener("click", () => {
+                void retryComposerAttachment(attachment.localId);
+            });
+            actions.appendChild(retryButton);
+        }
+
+        const removeButton = document.createElement("button");
+        removeButton.type = "button";
+        removeButton.className = "composer-attachment-remove";
+        removeButton.textContent = "삭제";
+        removeButton.addEventListener("click", () => {
+            void removeComposerAttachment(attachment.localId);
+        });
+        actions.appendChild(removeButton);
+
+        item.append(thumb, meta, actions);
+        fragment.appendChild(item);
+    });
+
+    elements.composerAttachmentList.appendChild(fragment);
+}
+
+async function queueSelectedFiles(fileList) {
+    const files = Array.from(fileList || []);
+    const validationMessage = validateSelectedImageFiles(files);
+    if (validationMessage) {
+        showToast(validationMessage, "error");
+        return;
+    }
+
+    const session = await ensureSessionBeforeAttachmentUpload();
+    if (!session) {
+        return;
+    }
+
+    const newAttachments = files.map(createComposerAttachmentItem);
+    state.composerAttachments.push(...newAttachments);
+    renderComposerAttachments();
+    updateComposerControls();
+
+    const localIds = newAttachments.map((attachment) => attachment.localId);
+    await compressQueuedAttachments(localIds);
+    await uploadReadyAttachments(session.id, localIds);
+    updateComposerControls();
+}
+
+async function compressQueuedAttachments(localIds) {
+    for (const localId of localIds) {
+        const attachment = getComposerAttachmentByLocalId(localId);
+        if (!attachment || attachment.status !== "queued") {
+            continue;
+        }
+
+        attachment.status = "compressing";
+        attachment.errorMessage = null;
+        renderComposerAttachments();
+        updateComposerControls();
+
+        try {
+            const compressed = await compressImageFile(attachment.originalFile);
+            if (attachment.previewObjectUrl) {
+                URL.revokeObjectURL(attachment.previewObjectUrl);
+            }
+            attachment.compressedFile = compressed.file;
+            attachment.previewObjectUrl = URL.createObjectURL(compressed.file);
+            attachment.compressedByteSize = compressed.file.size;
+            attachment.mimeType = compressed.file.type;
+            attachment.width = compressed.width;
+            attachment.height = compressed.height;
+            attachment.status = "ready_to_upload";
+        } catch (error) {
+            attachment.status = "failed";
+            attachment.errorMessage = error.message || "이미지를 5MB 이하로 압축하지 못했습니다.";
+        }
+
+        renderComposerAttachments();
+        updateComposerControls();
+    }
+}
+
+async function uploadReadyAttachments(sessionId, localIds) {
+    for (const localId of localIds) {
+        const attachment = getComposerAttachmentByLocalId(localId);
+        if (!attachment || attachment.status !== "ready_to_upload" || !attachment.compressedFile) {
+            continue;
+        }
+
+        attachment.status = "uploading";
+        attachment.errorMessage = null;
+        renderComposerAttachments();
+        updateComposerControls();
+
+        try {
+            const payload = await uploadAttachmentItem(sessionId, attachment);
+            const uploaded = payload?.attachment ?? payload;
+            attachment.status = "uploaded";
+            attachment.attachmentId = uploaded?.id ?? null;
+            attachment.contentUrl = uploaded?.contentUrl ?? attachment.previewObjectUrl;
+            attachment.fileName = uploaded?.fileName ?? attachment.fileName;
+            attachment.mimeType = uploaded?.mimeType ?? attachment.mimeType;
+            attachment.compressedByteSize = uploaded?.byteSize ?? attachment.compressedByteSize;
+            attachment.width = uploaded?.width ?? attachment.width;
+            attachment.height = uploaded?.height ?? attachment.height;
+        } catch (error) {
+            attachment.status = "failed";
+            attachment.errorMessage = error.message || "이미지를 업로드하지 못했습니다.";
+        }
+
+        renderComposerAttachments();
+        updateComposerControls();
+    }
+}
+
+async function uploadAttachmentItem(sessionId, attachment) {
+    const formData = new FormData();
+    formData.append("file", attachment.compressedFile, attachment.compressedFile.name);
+    formData.append("conversationId", sessionId);
+    formData.append("credentialEnvelope", state.copilot.envelope || "");
+
+    const response = await fetch("/api/uploads/images", {
+        method: "POST",
+        body: formData,
+    });
+    updateCredentialEnvelopeFromResponse(response);
+
+    if (!response.ok) {
+        const error = await extractErrorResponse(response);
+        if (response.status === 401) {
+            handleUnauthorizedCopilot(error.message);
+        }
+        throw new Error(error.message);
+    }
+
+    return response.json();
+}
+
+async function removeComposerAttachment(localId) {
+    const attachment = getComposerAttachmentByLocalId(localId);
+    if (!attachment) {
+        return;
+    }
+
+    if (COMPOSER_ATTACHMENT_BUSY_STATES.has(attachment.status)) {
+        showToast("이미지 처리가 끝난 뒤 삭제하세요.", "info");
+        return;
+    }
+
+    if (attachment.status === "uploaded" && attachment.attachmentId) {
+        try {
+            await requestJson(`/api/uploads/images/${encodeURIComponent(attachment.attachmentId)}`, {
+                method: "DELETE",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    conversationId: getActiveSession()?.id,
+                    credentialEnvelope: state.copilot.envelope,
+                }),
+            });
+        } catch (error) {
+            if (error.code === "copilot_login_required") {
+                handleUnauthorizedCopilot(error.message);
+            }
+            showToast(error.message || "첨부 이미지를 삭제하지 못했습니다.", "error");
+            return;
+        }
+    }
+
+    if (attachment.previewObjectUrl) {
+        URL.revokeObjectURL(attachment.previewObjectUrl);
+    }
+    state.composerAttachments = state.composerAttachments.filter((item) => item.localId !== localId);
+    renderComposerAttachments();
+    updateComposerControls();
+}
+
+async function retryComposerAttachment(localId) {
+    const attachment = getComposerAttachmentByLocalId(localId);
+    if (!attachment) {
+        return;
+    }
+
+    const session = await ensureSessionBeforeAttachmentUpload();
+    if (!session) {
+        return;
+    }
+
+    attachment.status = "queued";
+    attachment.errorMessage = null;
+    attachment.compressedFile = null;
+    attachment.attachmentId = null;
+    attachment.contentUrl = null;
+    attachment.compressedByteSize = null;
+    renderComposerAttachments();
+    await compressQueuedAttachments([localId]);
+    await uploadReadyAttachments(session.id, [localId]);
+}
+
+async function readExifOrientation(file) {
+    if (!(file instanceof File) || !/jpe?g$/i.test(file.type)) {
+        return 1;
+    }
+
+    const view = new DataView(await file.arrayBuffer());
+    if (view.byteLength < 4 || view.getUint16(0, false) !== 0xFFD8) {
+        return 1;
+    }
+
+    let offset = 2;
+    while (offset < view.byteLength) {
+        if (view.getUint8(offset) !== 0xFF) {
+            break;
+        }
+
+        const marker = view.getUint8(offset + 1);
+        offset += 2;
+        if (marker === 0xD9 || marker === 0xDA) {
+            break;
+        }
+
+        const segmentLength = view.getUint16(offset, false);
+        if (segmentLength < 2) {
+            break;
+        }
+
+        if (marker === 0xE1 && offset + segmentLength <= view.byteLength) {
+            const exifOffset = offset + 2;
+            if (view.getUint32(exifOffset, false) !== 0x45786966) {
+                return 1;
+            }
+            const tiffOffset = exifOffset + 6;
+            const littleEndian = view.getUint16(tiffOffset, false) === 0x4949;
+            const firstIfdOffset = view.getUint32(tiffOffset + 4, littleEndian);
+            const ifdOffset = tiffOffset + firstIfdOffset;
+            const entryCount = view.getUint16(ifdOffset, littleEndian);
+            for (let index = 0; index < entryCount; index += 1) {
+                const entryOffset = ifdOffset + 2 + (index * 12);
+                if (view.getUint16(entryOffset, littleEndian) === 0x0112) {
+                    return view.getUint16(entryOffset + 8, littleEndian);
+                }
+            }
+            return 1;
+        }
+
+        offset += segmentLength;
+    }
+
+    return 1;
+}
+
+async function loadImageBitmapFromFile(file) {
+    if (window.createImageBitmap) {
+        try {
+            return await window.createImageBitmap(file, { imageOrientation: "none" });
+        } catch {
+            return window.createImageBitmap(file);
+        }
+    }
+
+    return new Promise((resolve, reject) => {
+        const objectUrl = URL.createObjectURL(file);
+        const image = new Image();
+        image.onload = () => {
+            URL.revokeObjectURL(objectUrl);
+            resolve(image);
+        };
+        image.onerror = () => {
+            URL.revokeObjectURL(objectUrl);
+            reject(new Error("이미지 파일을 처리할 수 없습니다. 다른 파일을 선택하세요."));
+        };
+        image.src = objectUrl;
+    });
+}
+
+function applyOrientationTransform(context, orientation, width, height) {
+    switch (orientation) {
+        case 2:
+            context.translate(width, 0);
+            context.scale(-1, 1);
+            break;
+        case 3:
+            context.translate(width, height);
+            context.rotate(Math.PI);
+            break;
+        case 4:
+            context.translate(0, height);
+            context.scale(1, -1);
+            break;
+        case 5:
+            context.rotate(0.5 * Math.PI);
+            context.scale(1, -1);
+            break;
+        case 6:
+            context.rotate(0.5 * Math.PI);
+            context.translate(0, -height);
+            break;
+        case 7:
+            context.rotate(0.5 * Math.PI);
+            context.translate(width, -height);
+            context.scale(-1, 1);
+            break;
+        case 8:
+            context.rotate(-0.5 * Math.PI);
+            context.translate(-width, 0);
+            break;
+        default:
+            break;
+    }
+}
+
+function drawImageToCanvas(bitmap, dimensionLimit, orientation = 1) {
+    const sourceWidth = Number(bitmap.width || bitmap.naturalWidth || 0);
+    const sourceHeight = Number(bitmap.height || bitmap.naturalHeight || 0);
+    if (!sourceWidth || !sourceHeight) {
+        throw new Error("이미지 파일을 처리할 수 없습니다. 다른 파일을 선택하세요.");
+    }
+
+    const scale = Math.min(1, dimensionLimit / Math.max(sourceWidth, sourceHeight));
+    const drawWidth = Math.max(1, Math.round(sourceWidth * scale));
+    const drawHeight = Math.max(1, Math.round(sourceHeight * scale));
+    const rotate90 = [5, 6, 7, 8].includes(orientation);
+
+    const canvas = document.createElement("canvas");
+    canvas.width = rotate90 ? drawHeight : drawWidth;
+    canvas.height = rotate90 ? drawWidth : drawHeight;
+
+    const context = canvas.getContext("2d", { alpha: false });
+    if (!context) {
+        throw new Error("이미지 파일을 처리할 수 없습니다. 다른 파일을 선택하세요.");
+    }
+
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    applyOrientationTransform(context, orientation, drawWidth, drawHeight);
+    context.drawImage(bitmap, 0, 0, sourceWidth, sourceHeight, 0, 0, drawWidth, drawHeight);
+
+    return {
+        canvas,
+        width: canvas.width,
+        height: canvas.height,
+    };
+}
+
+function encodeCanvasToJpeg(canvas, quality) {
+    return new Promise((resolve) => {
+        canvas.toBlob((blob) => resolve(blob), "image/jpeg", quality);
+    });
+}
+
+async function compressImageFile(file) {
+    const orientation = await readExifOrientation(file);
+    const bitmap = await loadImageBitmapFromFile(file);
+
+    try {
+        for (const dimensionLimit of [INITIAL_IMAGE_MAX_DIMENSION, SECONDARY_IMAGE_MAX_DIMENSION]) {
+            const { canvas, width, height } = drawImageToCanvas(bitmap, dimensionLimit, orientation);
+            for (let quality = INITIAL_JPEG_QUALITY; quality >= MIN_JPEG_QUALITY; quality -= JPEG_QUALITY_STEP) {
+                const blob = await encodeCanvasToJpeg(canvas, quality);
+                if (!blob) {
+                    continue;
+                }
+                if (blob.size <= TARGET_COMPRESSED_IMAGE_BYTES) {
+                    return {
+                        file: new File([blob], replaceFileExtensionWithJpg(file.name), {
+                            type: "image/jpeg",
+                            lastModified: Date.now(),
+                        }),
+                        width,
+                        height,
+                    };
+                }
+            }
+        }
+    } finally {
+        bitmap.close?.();
+    }
+
+    throw new Error("이미지를 5MB 이하로 압축하지 못했습니다.");
+}
+
 function updateComposerControls() {
     const label = state.isStreaming ? "중지" : "보내기";
+    const hasText = Boolean(elements.promptInput.value.trim());
+    const hasUploadedAttachments = buildUploadedAttachmentPayload().length > 0;
+    const hasBusyAttachments = state.composerAttachments.some((attachment) => COMPOSER_ATTACHMENT_BUSY_STATES.has(attachment.status));
     elements.sendButtonText.textContent = label;
     elements.sendButton.setAttribute("aria-label", label);
     elements.sendButton.classList.toggle("danger", state.isStreaming);
-    elements.sendButton.disabled = !state.isStreaming && !elements.promptInput.value.trim();
+    elements.sendButton.disabled = !state.isStreaming && ((!hasText && !hasUploadedAttachments) || hasBusyAttachments);
+    if (elements.attachmentButton) {
+        elements.attachmentButton.disabled = state.isStreaming;
+    }
 }
 
 function clearComposerStatusTimer() {
@@ -2031,6 +2785,7 @@ async function disconnectCopilot() {
             method: "POST",
         });
         persistCredentialEnvelope("");
+        clearComposerAttachments();
         resetLoginFlowState();
         state.copilot.status = "disconnected";
         state.copilot.errorMessage = "";
@@ -2077,7 +2832,14 @@ async function handleAuthSecondaryAction() {
 
 async function sendPrompt() {
     const content = elements.promptInput.value.trim();
-    if (!content) {
+    const uploadedAttachments = buildUploadedAttachmentPayload();
+    const optimisticAttachments = buildOptimisticAttachmentPayload();
+    if (!content && uploadedAttachments.length === 0) {
+        return;
+    }
+
+    if (state.composerAttachments.some((attachment) => COMPOSER_ATTACHMENT_BUSY_STATES.has(attachment.status))) {
+        showToast("이미지 업로드가 끝난 뒤 전송하세요.", "info");
         return;
     }
 
@@ -2097,6 +2859,7 @@ async function sendPrompt() {
         id: createId("message"),
         role: "user",
         content,
+        attachments: optimisticAttachments,
         status: "complete",
     };
 
@@ -2115,8 +2878,6 @@ async function sendPrompt() {
     session.messages.push(assistantMessage);
     session.updatedAt = Date.now();
 
-    elements.promptInput.value = "";
-    adjustTextareaHeight();
     renderSidebar();
     renderMessages();
 
@@ -2137,6 +2898,7 @@ async function sendPrompt() {
             },
             body: JSON.stringify({
                 content,
+                attachments: uploadedAttachments,
                 model: session.model || DEFAULT_MODEL,
                 credentialEnvelope: state.copilot.envelope,
                 tools: CHAT_TOOLS_PAYLOAD,
@@ -2158,10 +2920,14 @@ async function sendPrompt() {
                 openAuthModal();
                 renderAuthState();
             }
+            shouldResyncConversation = true;
             throw new Error(error.message);
         }
 
         didPersistTurn = true;
+        elements.promptInput.value = "";
+        adjustTextareaHeight();
+        clearComposerAttachments();
 
         if (!response.body) {
             throw new Error("스트리밍 응답을 받을 수 없습니다.");
@@ -2176,7 +2942,11 @@ async function sendPrompt() {
             setComposerStatus(COMPOSER_ABORTED_MESSAGE, "stopped", { persistMs: COMPOSER_STATUS_HOLD_MS });
             showToast("응답 생성을 중단했습니다.", "info");
         } else {
-            shouldResyncConversation = didPersistTurn || !didReceiveResponse;
+            shouldResyncConversation = true;
+            if (!didPersistTurn) {
+                elements.promptInput.value = content;
+                adjustTextareaHeight();
+            }
             if (!assistantMessage.content) {
                 applyAssistantFailureMessage(
                     session,
@@ -2221,7 +2991,7 @@ function handleComposerSubmit(event) {
         return;
     }
 
-    sendPrompt();
+    void sendPrompt();
 }
 
 function setSidebarOverlayOpen(isOpen, options = {}) {
@@ -2279,6 +3049,17 @@ function bindEvents() {
 
     elements.newChatButton.addEventListener("click", () => {
         void createSession();
+    });
+
+    elements.attachmentButton?.addEventListener("click", openAttachmentPicker);
+    elements.attachmentInput?.addEventListener("change", (event) => {
+        void handleAttachmentInputChange(event);
+    });
+    elements.composerDropzone?.addEventListener("dragover", handleComposerDragOver);
+    elements.composerDropzone?.addEventListener("dragenter", handleComposerDragEnter);
+    elements.composerDropzone?.addEventListener("dragleave", handleComposerDragLeave);
+    elements.composerDropzone?.addEventListener("drop", (event) => {
+        void handleComposerDrop(event);
     });
 
     elements.modelSelect.addEventListener("change", async (event) => {
@@ -2345,6 +3126,7 @@ function bindEvents() {
     window.addEventListener("beforeunload", () => {
         clearComposerStatusTimer();
         clearSidebarOverlayTimer();
+        cleanupComposerAttachmentObjectUrls();
         state.abortController?.abort();
         state.copilot.loginAbortController?.abort();
     });
@@ -2353,6 +3135,7 @@ function bindEvents() {
 async function init() {
     bindEvents();
     syncViewportHeightVar();
+    renderComposerAttachments();
     adjustTextareaHeight();
     updateComposerControls();
     syncComposerStatus();

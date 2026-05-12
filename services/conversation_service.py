@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -21,13 +22,20 @@ DEFAULT_ASSISTANT_STATE = "complete"
 DEFAULT_CHAT_HISTORY_TTL_SECONDS = 60 * 60 * 24 * 7
 DEFAULT_CHAT_HISTORY_CLEANUP_INTERVAL_SECONDS = 60
 MAX_CONVERSATION_TITLE_LENGTH = 80
+MAX_ATTACHMENTS_PER_MESSAGE = 5
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
 class ConversationTurn:
     model: str
-    visible_messages: list[dict[str, str]]
+    prior_messages: list[dict[str, Any]]
+    new_user_message: dict[str, Any]
     assistant_message_id: str
+
+    @property
+    def visible_messages(self) -> list[dict[str, Any]]:
+        return [*self.prior_messages, self.new_user_message]
 
 
 class ConversationStateError(Exception):
@@ -239,16 +247,146 @@ class ChatHistoryRepository:
 
         return self.get_state_payload(scope_id)
 
+    def create_attachment(
+        self,
+        scope_id: str,
+        conversation_id: str,
+        *,
+        attachment_id: str | None = None,
+        original_filename: str,
+        mime_type: str,
+        byte_size: int,
+        width: int,
+        height: int,
+        storage_path: str,
+    ) -> dict[str, Any]:
+        current_time = time.time()
+        attachment_id = attachment_id or f"att_{secrets.token_urlsafe(12)}"
+
+        with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
+            self._require_conversation(connection, scope_id, conversation_id)
+            connection.execute(
+                """
+                INSERT INTO conversation_attachments (
+                    id,
+                    scope_id,
+                    conversation_id,
+                    message_id,
+                    original_filename,
+                    mime_type,
+                    byte_size,
+                    width,
+                    height,
+                    storage_path,
+                    status,
+                    created_at,
+                    updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    attachment_id,
+                    scope_id,
+                    conversation_id,
+                    None,
+                    original_filename,
+                    mime_type,
+                    byte_size,
+                    width,
+                    height,
+                    storage_path,
+                    "uploaded",
+                    current_time,
+                    current_time,
+                ),
+            )
+            row = self._require_attachment(connection, scope_id, conversation_id, attachment_id)
+
+        payload = self._attachment_row_to_payload(row)
+        payload["createdAt"] = float(row["created_at"])
+        return payload
+
+    def get_attachment_record(
+        self,
+        scope_id: str,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, time.time())
+            row = self._require_attachment(connection, scope_id, conversation_id, attachment_id)
+        return self._attachment_row_to_internal_payload(row)
+
+    def get_attachment_record_for_content(
+        self,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, time.time())
+            row = connection.execute(
+                """
+                SELECT id, scope_id, conversation_id, message_id, original_filename, mime_type,
+                       byte_size, width, height, storage_path, status, created_at, updated_at
+                FROM conversation_attachments
+                WHERE id = ? AND conversation_id = ?
+                """,
+                (attachment_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                raise ConversationStateError(
+                    status_code=404,
+                    message="첨부 이미지를 찾을 수 없습니다. 다시 업로드하세요.",
+                    code="attachment_not_found",
+                )
+        return self._attachment_row_to_internal_payload(row)
+
+    def delete_pending_attachment(
+        self,
+        scope_id: str,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        current_time = time.time()
+        with self._connection() as connection:
+            self._maybe_purge_expired_history(connection, current_time)
+            row = self._require_attachment(connection, scope_id, conversation_id, attachment_id)
+            if row["message_id"] is not None:
+                raise ConversationStateError(
+                    status_code=409,
+                    message="이미 전송에 사용된 첨부 이미지입니다. 다시 업로드하세요.",
+                    code="attachment_already_attached",
+                )
+            payload = self._attachment_row_to_internal_payload(row)
+            connection.execute(
+                """
+                DELETE FROM conversation_attachments
+                WHERE id = ? AND conversation_id = ? AND scope_id = ? AND message_id IS NULL
+                """,
+                (attachment_id, conversation_id, scope_id),
+            )
+            connection.execute(
+                """
+                UPDATE conversations
+                SET updated_at = ?
+                WHERE id = ? AND scope_id = ?
+                """,
+                (current_time, conversation_id, scope_id),
+            )
+        return payload
+
     def begin_turn(
         self,
         scope_id: str,
         conversation_id: str,
         *,
         content: str,
+        attachment_ids: list[str] | None = None,
         model: str | None,
     ) -> ConversationTurn:
         current_time = time.time()
         assistant_message_id = f"msg_{secrets.token_urlsafe(12)}"
+        normalized_attachment_ids = list(dict.fromkeys(attachment_ids or []))
 
         with self._connection() as connection:
             self._maybe_purge_expired_history(connection, current_time)
@@ -262,6 +400,12 @@ class ChatHistoryRepository:
             )
             visible_messages = self._load_visible_messages(connection, [conversation_id]).get(conversation_id, [])
             model_id = model or str(conversation_row["model"])
+            attachments = self._require_pending_attachments(
+                connection,
+                scope_id,
+                conversation_id,
+                normalized_attachment_ids,
+            )
             next_ordinal = self._next_ordinal(connection, conversation_id)
             user_message_id = f"msg_{secrets.token_urlsafe(12)}"
             connection.execute(
@@ -312,10 +456,23 @@ class ChatHistoryRepository:
                     current_time,
                 ),
             )
+            if attachments:
+                placeholders = ", ".join("?" for _ in attachments)
+                connection.execute(
+                    f"""
+                    UPDATE conversation_attachments
+                    SET message_id = ?, status = 'attached', updated_at = ?
+                    WHERE id IN ({placeholders})
+                    """,
+                    (user_message_id, current_time, *(str(row["id"]) for row in attachments)),
+                )
             has_existing_user_message = any(message["role"] == "user" for message in visible_messages)
             title = str(conversation_row["title"])
             if not has_existing_user_message and title == DEFAULT_CONVERSATION_TITLE:
-                title = self._derive_conversation_title(content)
+                if content:
+                    title = self._derive_conversation_title(content)
+                elif attachments:
+                    title = self._derive_attachment_title(len(attachments))
             connection.execute(
                 """
                 UPDATE conversations
@@ -335,16 +492,15 @@ class ChatHistoryRepository:
 
         return ConversationTurn(
             model=model_id,
-            visible_messages=[
-                *[
-                    {
-                        "role": str(message["role"]),
-                        "content": str(message["content"]),
-                    }
-                    for message in visible_messages
+            prior_messages=visible_messages,
+            new_user_message={
+                "role": "user",
+                "content": content,
+                "attachments": [
+                    self._attachment_row_to_internal_payload(row)
+                    for row in attachments
                 ],
-                {"role": "user", "content": content},
-            ],
+            },
             assistant_message_id=assistant_message_id,
         )
 
@@ -494,6 +650,27 @@ class ChatHistoryRepository:
             )
             connection.execute(
                 """
+                CREATE TABLE IF NOT EXISTS conversation_attachments (
+                    id TEXT PRIMARY KEY,
+                    scope_id TEXT NOT NULL,
+                    conversation_id TEXT NOT NULL,
+                    message_id TEXT,
+                    original_filename TEXT NOT NULL,
+                    mime_type TEXT NOT NULL,
+                    byte_size INTEGER NOT NULL,
+                    width INTEGER NOT NULL,
+                    height INTEGER NOT NULL,
+                    storage_path TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    updated_at REAL NOT NULL,
+                    FOREIGN KEY(conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                    FOREIGN KEY(message_id) REFERENCES conversation_messages(id) ON DELETE SET NULL
+                )
+                """
+            )
+            connection.execute(
+                """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_conversation_messages_ordinal
                 ON conversation_messages (conversation_id, ordinal)
                 """
@@ -502,6 +679,24 @@ class ChatHistoryRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_conversation_messages_visible
                 ON conversation_messages (conversation_id, ordinal, updated_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_attachments_conversation
+                ON conversation_attachments (conversation_id, created_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_attachments_message
+                ON conversation_attachments (message_id, created_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_conversation_attachments_scope_status
+                ON conversation_attachments (scope_id, status, created_at)
                 """
             )
 
@@ -529,13 +724,58 @@ class ChatHistoryRepository:
             now_monotonic = 0.0
 
         cutoff = current_time - self.ttl_seconds
-        connection.execute(
+        expired_conversation_rows = connection.execute(
             """
-            DELETE FROM conversations
+            SELECT id
+            FROM conversations
             WHERE updated_at <= ?
             """,
             (cutoff,),
-        )
+        ).fetchall()
+        expired_conversation_ids = [str(row["id"]) for row in expired_conversation_rows]
+        blocked_conversation_ids: set[str] = set()
+
+        if expired_conversation_ids:
+            placeholders = ", ".join("?" for _ in expired_conversation_ids)
+            expired_attachment_rows = connection.execute(
+                f"""
+                SELECT conversation_id, storage_path
+                FROM conversation_attachments
+                WHERE conversation_id IN ({placeholders})
+                """,
+                tuple(expired_conversation_ids),
+            ).fetchall()
+            for row in expired_attachment_rows:
+                conversation_id = str(row["conversation_id"])
+                storage_path = self._normalize_text(row["storage_path"])
+                if not storage_path:
+                    continue
+                try:
+                    Path(storage_path).unlink(missing_ok=True)
+                except OSError:
+                    blocked_conversation_ids.add(conversation_id)
+                    LOGGER.warning(
+                        "Failed to delete expired attachment file during cleanup: conversation_id=%s storage_path=%s",
+                        conversation_id,
+                        storage_path,
+                        exc_info=True,
+                    )
+
+            deletable_conversation_ids = [
+                conversation_id
+                for conversation_id in expired_conversation_ids
+                if conversation_id not in blocked_conversation_ids
+            ]
+            if deletable_conversation_ids:
+                placeholders = ", ".join("?" for _ in deletable_conversation_ids)
+                connection.execute(
+                    f"""
+                    DELETE FROM conversations
+                    WHERE id IN ({placeholders})
+                    """,
+                    tuple(deletable_conversation_ids),
+                )
+
         connection.execute(
             """
             DELETE FROM conversation_scopes
@@ -564,14 +804,55 @@ class ChatHistoryRepository:
             f"""
             SELECT id, conversation_id, role, content, state, created_at, updated_at
             FROM conversation_messages
-            WHERE conversation_id IN ({placeholders}) AND content != ''
+            WHERE conversation_id IN ({placeholders})
+              AND (
+                    content != ''
+                    OR EXISTS (
+                        SELECT 1
+                        FROM conversation_attachments
+                        WHERE conversation_attachments.message_id = conversation_messages.id
+                    )
+                  )
             ORDER BY conversation_id ASC, ordinal ASC, created_at ASC, id ASC
             """,
             tuple(conversation_ids),
         ).fetchall()
+        attachments_by_message_id = self._load_attachments_by_message_ids(
+            connection,
+            [str(row["id"]) for row in rows],
+        )
         for row in rows:
             conversation_id = str(row["conversation_id"])
-            grouped.setdefault(conversation_id, []).append(self._message_row_to_payload(row))
+            grouped.setdefault(conversation_id, []).append(
+                self._message_row_to_payload(
+                    row,
+                    attachments_by_message_id.get(str(row["id"]), []),
+                )
+            )
+        return grouped
+
+    def _load_attachments_by_message_ids(
+        self,
+        connection: sqlite3.Connection,
+        message_ids: list[str],
+    ) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {message_id: [] for message_id in message_ids}
+        if not message_ids:
+            return grouped
+
+        placeholders = ", ".join("?" for _ in message_ids)
+        rows = connection.execute(
+            f"""
+            SELECT id, scope_id, conversation_id, message_id, original_filename, mime_type,
+                   byte_size, width, height, storage_path, status, created_at, updated_at
+            FROM conversation_attachments
+            WHERE message_id IN ({placeholders})
+            ORDER BY created_at ASC, id ASC
+            """,
+            tuple(message_ids),
+        ).fetchall()
+        for row in rows:
+            grouped.setdefault(str(row["message_id"]), []).append(self._attachment_row_to_payload(row))
         return grouped
 
     def _require_conversation(
@@ -622,6 +903,60 @@ class ChatHistoryRepository:
                 code="conversation_not_found",
             )
 
+    def _require_attachment(
+        self,
+        connection: sqlite3.Connection,
+        scope_id: str,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """
+            SELECT id, scope_id, conversation_id, message_id, original_filename, mime_type,
+                   byte_size, width, height, storage_path, status, created_at, updated_at
+            FROM conversation_attachments
+            WHERE id = ? AND scope_id = ? AND conversation_id = ?
+            """,
+            (attachment_id, scope_id, conversation_id),
+        ).fetchone()
+        if row is None:
+            raise ConversationStateError(
+                status_code=404,
+                message="첨부 이미지를 찾을 수 없습니다. 다시 업로드하세요.",
+                code="attachment_not_found",
+            )
+        return row
+
+    def _require_pending_attachments(
+        self,
+        connection: sqlite3.Connection,
+        scope_id: str,
+        conversation_id: str,
+        attachment_ids: list[str],
+    ) -> list[sqlite3.Row]:
+        if not attachment_ids:
+            return []
+
+        if len(attachment_ids) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise ConversationStateError(
+                status_code=400,
+                message="이미지는 한 번에 최대 5개까지 전송할 수 있습니다.",
+                code="conversation_attachments_limit_exceeded",
+            )
+
+        rows = [
+            self._require_attachment(connection, scope_id, conversation_id, attachment_id)
+            for attachment_id in attachment_ids
+        ]
+        for row in rows:
+            if row["message_id"] is not None:
+                raise ConversationStateError(
+                    status_code=409,
+                    message="이미 전송에 사용된 첨부 이미지입니다. 다시 업로드하세요.",
+                    code="attachment_already_attached",
+                )
+        return rows
+
     def _next_ordinal(self, connection: sqlite3.Connection, conversation_id: str) -> int:
         row = connection.execute(
             """
@@ -649,15 +984,44 @@ class ChatHistoryRepository:
             "updatedAt": float(row["updated_at"]),
         }
 
-    def _message_row_to_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+    def _message_row_to_payload(
+        self,
+        row: sqlite3.Row,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "id": str(row["id"]),
             "role": str(row["role"]),
             "content": str(row["content"]),
+            "attachments": list(attachments or []),
             "status": str(row["state"]),
             "createdAt": float(row["created_at"]),
             "updatedAt": float(row["updated_at"]),
         }
+
+    def _attachment_row_to_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": str(row["id"]),
+            "fileName": str(row["original_filename"]),
+            "mimeType": str(row["mime_type"]),
+            "byteSize": int(row["byte_size"]),
+            "width": int(row["width"]),
+            "height": int(row["height"]),
+        }
+
+    def _attachment_row_to_internal_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        payload = self._attachment_row_to_payload(row)
+        payload.update(
+            {
+                "conversationId": str(row["conversation_id"]),
+                "messageId": None if row["message_id"] is None else str(row["message_id"]),
+                "status": str(row["status"]),
+                "storagePath": str(row["storage_path"]),
+                "createdAt": float(row["created_at"]),
+                "updatedAt": float(row["updated_at"]),
+            }
+        )
+        return payload
 
     def _derive_conversation_title(self, content: str) -> str:
         normalized = re.sub(r"\s+", " ", content).strip()
@@ -666,6 +1030,13 @@ class ChatHistoryRepository:
         if len(normalized) <= 42:
             return normalized
         return f"{normalized[:42].rstrip()}..."
+
+    def _derive_attachment_title(self, attachment_count: int) -> str:
+        if attachment_count <= 0:
+            return DEFAULT_CONVERSATION_TITLE
+        if attachment_count == 1:
+            return "이미지 1개"
+        return f"이미지 {attachment_count}개"
 
     def _normalize_text(self, value: Any) -> str | None:
         if not isinstance(value, str):
@@ -700,6 +1071,9 @@ class ConversationService:
     def create_conversation(self, scope_id: str, model: str) -> dict[str, Any]:
         return self._repository.create_conversation(scope_id, model)
 
+    def get_conversation_payload(self, scope_id: str, conversation_id: str) -> dict[str, Any]:
+        return self._repository.get_conversation_payload(scope_id, conversation_id)
+
     def activate_conversation(self, scope_id: str, conversation_id: str) -> None:
         self._repository.activate_conversation(scope_id, conversation_id)
 
@@ -732,14 +1106,110 @@ class ConversationService:
     def delete_conversation(self, scope_id: str, conversation_id: str) -> dict[str, Any]:
         return self._repository.delete_conversation(scope_id, conversation_id)
 
-    def validate_message_content(self, content: str) -> str:
-        if not isinstance(content, str) or not content.strip():
+    def create_attachment(
+        self,
+        scope_id: str,
+        conversation_id: str,
+        *,
+        attachment_id: str | None = None,
+        original_filename: str,
+        mime_type: str,
+        byte_size: int,
+        width: int,
+        height: int,
+        storage_path: str,
+    ) -> dict[str, Any]:
+        return self._repository.create_attachment(
+            scope_id,
+            conversation_id,
+            attachment_id=attachment_id,
+            original_filename=original_filename,
+            mime_type=mime_type,
+            byte_size=byte_size,
+            width=width,
+            height=height,
+            storage_path=storage_path,
+        )
+
+    def require_conversation(self, scope_id: str, conversation_id: str) -> None:
+        current_time = time.time()
+        with self._repository._connection() as connection:
+            self._repository._maybe_purge_expired_history(connection, current_time)
+            self._repository._require_conversation(connection, scope_id, conversation_id)
+
+    def get_attachment_record(
+        self,
+        scope_id: str,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        return self._repository.get_attachment_record(scope_id, conversation_id, attachment_id)
+
+    def get_attachment_record_for_content(
+        self,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        return self._repository.get_attachment_record_for_content(conversation_id, attachment_id)
+
+    def delete_pending_attachment(
+        self,
+        scope_id: str,
+        conversation_id: str,
+        attachment_id: str,
+    ) -> dict[str, Any]:
+        return self._repository.delete_pending_attachment(scope_id, conversation_id, attachment_id)
+
+    def validate_message_input(self, content: Any, attachments: Any) -> tuple[str, list[str]]:
+        if not isinstance(content, str):
             raise ConversationStateError(
                 status_code=400,
-                message="보낼 메시지를 입력하세요.",
+                message="첨부 이미지 형식이 올바르지 않습니다.",
+                code="conversation_attachments_invalid",
+            )
+        if not isinstance(attachments, list):
+            raise ConversationStateError(
+                status_code=400,
+                message="첨부 이미지 형식이 올바르지 않습니다.",
+                code="conversation_attachments_invalid",
+            )
+
+        normalized_content = content.strip()
+        normalized_attachment_ids: list[str] = []
+        for attachment in attachments:
+            if not isinstance(attachment, dict):
+                raise ConversationStateError(
+                    status_code=400,
+                    message="첨부 이미지 형식이 올바르지 않습니다.",
+                    code="conversation_attachments_invalid",
+                )
+            attachment_id = self._repository._normalize_text(attachment.get("id"))
+            if not attachment_id:
+                raise ConversationStateError(
+                    status_code=400,
+                    message="첨부 이미지 형식이 올바르지 않습니다.",
+                    code="conversation_attachments_invalid",
+                )
+            normalized_attachment_ids.append(attachment_id)
+
+        normalized_attachment_ids = list(dict.fromkeys(normalized_attachment_ids))
+        if len(normalized_attachment_ids) > MAX_ATTACHMENTS_PER_MESSAGE:
+            raise ConversationStateError(
+                status_code=400,
+                message="이미지는 한 번에 최대 5개까지 전송할 수 있습니다.",
+                code="conversation_attachments_limit_exceeded",
+            )
+        if not normalized_content and not normalized_attachment_ids:
+            raise ConversationStateError(
+                status_code=400,
+                message="보낼 메시지 또는 이미지를 추가하세요.",
                 code="conversation_message_required",
             )
-        return content.strip()
+        return normalized_content, normalized_attachment_ids
+
+    def validate_message_content(self, content: str) -> str:
+        normalized_content, _ = self.validate_message_input(content, [])
+        return normalized_content
 
     def begin_turn(
         self,
@@ -747,12 +1217,14 @@ class ConversationService:
         conversation_id: str,
         *,
         content: str,
+        attachment_ids: list[str] | None = None,
         model: str | None,
     ) -> ConversationTurn:
         return self._repository.begin_turn(
             scope_id,
             conversation_id,
             content=content,
+            attachment_ids=attachment_ids,
             model=model,
         )
 
