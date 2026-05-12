@@ -17,6 +17,7 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+.playwright-mcp
 .oracleCloud/
 scratch.py
 
