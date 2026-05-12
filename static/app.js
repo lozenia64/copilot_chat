@@ -90,6 +90,9 @@ const WEB_SEARCH_TOOL_SPEC = Object.freeze({
 });
 const CHAT_TOOLS_PAYLOAD = Object.freeze([WEB_SEARCH_TOOL_SPEC]);
 const CHAT_TOOL_CHOICE = "auto";
+const ASSISTANT_STATUS_MESSAGES = Object.freeze({
+    web_searching: "🔎 웹 검색 중",
+});
 const USAGE_VISUAL_CONFIG = Object.freeze({
     chatMessages: { low: 5, medium: 20, high: 60 },
 });
@@ -254,12 +257,54 @@ function normalizeServerAttachment(attachment) {
     };
 }
 
+function normalizeMessageSources(sources) {
+    if (!Array.isArray(sources)) {
+        return [];
+    }
+
+    const normalizedSources = [];
+    const seenUrls = new Set();
+    sources.forEach((source) => {
+        const title = typeof source?.title === "string" ? source.title.trim() : "";
+        const url = normalizeSourceUrl(source?.url);
+        if (!title || !url || seenUrls.has(url)) {
+            return;
+        }
+        normalizedSources.push({ title, url });
+        seenUrls.add(url);
+    });
+    return normalizedSources;
+}
+
+function normalizeSourceUrl(url) {
+    if (typeof url !== "string") {
+        return "";
+    }
+
+    const trimmedUrl = url.trim();
+    if (!trimmedUrl) {
+        return "";
+    }
+
+    try {
+        const parsedUrl = new URL(trimmedUrl);
+        if (parsedUrl.protocol !== "http:" && parsedUrl.protocol !== "https:") {
+            return "";
+        }
+    } catch {
+        return "";
+    }
+
+    return trimmedUrl;
+}
+
 function normalizeServerMessage(message) {
     return {
         id: typeof message?.id === "string" && message.id ? message.id : createId("message"),
         role: typeof message?.role === "string" && message.role ? message.role : "assistant",
         content: typeof message?.content === "string" ? message.content : "",
         attachments: Array.isArray(message?.attachments) ? message.attachments.map(normalizeServerAttachment) : [],
+        sources: normalizeMessageSources(message?.sources),
         status: typeof message?.status === "string" && message.status ? message.status : "complete",
         createdAt: Number.isFinite(Number(message?.createdAt)) ? Number(message.createdAt) : Date.now(),
         updatedAt: Number.isFinite(Number(message?.updatedAt)) ? Number(message.updatedAt) : Date.now(),
@@ -821,23 +866,74 @@ function renderMessageAttachments(container, attachments) {
     }
 }
 
+function renderMessageSources(container, message) {
+    if (message?.role !== "assistant") {
+        return;
+    }
+
+    const sources = normalizeMessageSources(message?.sources);
+    if (sources.length === 0) {
+        return;
+    }
+
+    const footer = document.createElement("div");
+    footer.className = "message-sources";
+
+    const label = document.createElement("span");
+    label.className = "message-sources-label";
+    label.textContent = "Sources";
+
+    const list = document.createElement("div");
+    list.className = "message-sources-list";
+
+    sources.forEach((source) => {
+        const link = document.createElement("a");
+        link.className = "message-source-link";
+        link.href = source.url;
+        link.target = "_blank";
+        link.rel = "noreferrer noopener";
+        link.textContent = source.title;
+        list.appendChild(link);
+    });
+
+    footer.append(label, list);
+    container.appendChild(footer);
+}
+
+function shouldRenderStreamFocusAnchor(message) {
+    return state.isStreaming && message?.role === "assistant" && message.status === "streaming";
+}
+
+function renderMessageStreamFocusAnchor(container, message) {
+    if (!shouldRenderStreamFocusAnchor(message)) {
+        return;
+    }
+
+    const anchor = document.createElement("div");
+    anchor.className = "message-stream-anchor";
+    anchor.dataset.streamFocusAnchor = "true";
+    anchor.setAttribute("aria-hidden", "true");
+    container.appendChild(anchor);
+}
+
 function renderMessageBody(container, message) {
     container.innerHTML = "";
     renderMessageAttachments(container, message.attachments);
 
     if (message.content) {
-        renderMarkdownInto(container, message.content);
-        return;
+        const content = document.createElement("div");
+        content.className = "message-content";
+        renderMarkdownInto(content, message.content);
+        container.appendChild(content);
+    } else if (!(Array.isArray(message.attachments) && message.attachments.length > 0)) {
+        const pending = document.createElement("span");
+        pending.className = "pending-text";
+        pending.textContent = state.isStreaming && message.role === "assistant" ? "생성 중" : "";
+        container.appendChild(pending);
     }
 
-    if (Array.isArray(message.attachments) && message.attachments.length > 0) {
-        return;
-    }
-
-    const pending = document.createElement("span");
-    pending.className = "pending-text";
-    pending.textContent = state.isStreaming && message.role === "assistant" ? "생성 중" : "";
-    container.appendChild(pending);
+    renderMessageStreamFocusAnchor(container, message);
+    renderMessageSources(container, message);
 }
 
 function createMessageElement(message) {
@@ -854,18 +950,28 @@ function createMessageElement(message) {
     return article;
 }
 
-function updateMessageContent(message) {
+function updateMessageContent(message, options = {}) {
     if (state.activeSessionId !== getSessionIdByMessage(message.id)) {
         return;
     }
 
+    const { useStreamFocus = false } = options;
+
     const body = elements.messages.querySelector(`[data-message-id="${message.id}"] .message-body`);
     if (!body) {
         renderMessages();
+        if (useStreamFocus) {
+            scrollStreamingMessageIntoView(message.id);
+        }
         return;
     }
 
     renderMessageBody(body, message);
+    if (useStreamFocus) {
+        scrollStreamingMessageIntoView(message.id);
+        return;
+    }
+
     scrollMessagesToBottom();
 }
 
@@ -1786,6 +1892,40 @@ function scrollMessagesToBottom() {
     elements.messages.scrollTop = elements.messages.scrollHeight;
 }
 
+function scrollStreamingMessageIntoView(messageId) {
+    const anchor = elements.messages.querySelector(
+        `[data-message-id="${messageId}"] [data-stream-focus-anchor="true"]`,
+    );
+    if (!anchor) {
+        scrollMessagesToBottom();
+        return;
+    }
+
+    const containerRect = elements.messages.getBoundingClientRect();
+    if (!containerRect.height) {
+        return;
+    }
+
+    const anchorRect = anchor.getBoundingClientRect();
+    const bottomInset = Number.parseFloat(window.getComputedStyle(elements.messages).scrollPaddingBottom) || 0;
+    const visibleBottom = containerRect.bottom - bottomInset;
+
+    if (anchorRect.bottom > visibleBottom) {
+        elements.messages.scrollTop = Math.min(
+            elements.messages.scrollHeight,
+            elements.messages.scrollTop + (anchorRect.bottom - visibleBottom),
+        );
+        return;
+    }
+
+    if (anchorRect.top < containerRect.top) {
+        elements.messages.scrollTop = Math.max(
+            0,
+            elements.messages.scrollTop - (containerRect.top - anchorRect.top),
+        );
+    }
+}
+
 function scheduleScrollMessagesToBottom(frameCount = 2) {
     let remainingFrames = Math.max(frameCount, 1);
 
@@ -2413,6 +2553,22 @@ function extractStreamText(payload) {
     return "";
 }
 
+function extractAssistantSources(payload) {
+    if (!payload || typeof payload !== "object" || payload.type !== "assistant_sources") {
+        return [];
+    }
+
+    return normalizeMessageSources(payload.sources);
+}
+
+function extractAssistantStatus(payload) {
+    if (!payload || typeof payload !== "object" || payload.type !== "assistant_status") {
+        return "";
+    }
+
+    return typeof payload.status === "string" ? payload.status : "";
+}
+
 function extractStreamError(payload) {
     if (!payload || typeof payload !== "object") {
         return "";
@@ -2421,7 +2577,7 @@ function extractStreamError(payload) {
     return resolveServerErrorMessage(extractServerErrorCode(payload), "");
 }
 
-function processSseEvent(eventText, onChunk) {
+function processSseEvent(eventText, onChunk, onSources, onStatus) {
     const dataLines = eventText
         .split(/\r?\n/)
         .filter((line) => line.startsWith("data:"))
@@ -2448,6 +2604,16 @@ function processSseEvent(eventText, onChunk) {
         return { finished: false, error };
     }
 
+    const sources = extractAssistantSources(payload);
+    if (sources.length > 0) {
+        onSources(sources);
+    }
+
+    const status = extractAssistantStatus(payload);
+    if (status) {
+        onStatus(status);
+    }
+
     const chunk = extractStreamText(payload);
     if (chunk) {
         onChunk(chunk);
@@ -2462,9 +2628,27 @@ async function consumeChatStream(stream, session, assistantMessage) {
     let buffer = "";
 
     const appendChunk = (chunk) => {
+        if (state.composerStatus.message !== COMPOSER_STREAMING_MESSAGE) {
+            setComposerStatus(COMPOSER_STREAMING_MESSAGE, "pending");
+        }
         assistantMessage.content += chunk;
         session.updatedAt = Date.now();
-        updateMessageContent(assistantMessage);
+        updateMessageContent(assistantMessage, { useStreamFocus: true });
+    };
+
+    const applySources = (sources) => {
+        assistantMessage.sources = sources;
+        session.updatedAt = Date.now();
+        updateMessageContent(assistantMessage, { useStreamFocus: true });
+    };
+
+    const applyAssistantStatus = (status) => {
+        const message = ASSISTANT_STATUS_MESSAGES[status];
+        if (!message) {
+            return;
+        }
+
+        setComposerStatus(message, "pending");
     };
 
     try {
@@ -2479,7 +2663,7 @@ async function consumeChatStream(stream, session, assistantMessage) {
             buffer = events.pop() ?? "";
 
             for (const eventText of events) {
-                const result = processSseEvent(eventText, appendChunk);
+                const result = processSseEvent(eventText, appendChunk, applySources, applyAssistantStatus);
                 if (result.error) {
                     throw new Error(result.error);
                 }
@@ -2491,7 +2675,7 @@ async function consumeChatStream(stream, session, assistantMessage) {
 
         buffer += decoder.decode();
         if (buffer.trim()) {
-            const result = processSseEvent(buffer, appendChunk);
+            const result = processSseEvent(buffer, appendChunk, applySources, applyAssistantStatus);
             if (result.error) {
                 throw new Error(result.error);
             }
@@ -2886,6 +3070,7 @@ async function sendPrompt() {
         id: createId("message"),
         role: "assistant",
         content: "",
+        sources: [],
         status: "streaming",
     };
 

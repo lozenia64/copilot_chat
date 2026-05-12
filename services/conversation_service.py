@@ -15,6 +15,8 @@ from typing import Any
 
 from fastapi import Request
 
+from .web_search import normalize_source_url
+
 
 DEFAULT_CHAT_HISTORY_DB_PATH = Path(__file__).resolve().parent.parent / ".copilot_chat_history.sqlite3"
 DEFAULT_CONVERSATION_TITLE = "새 대화"
@@ -24,6 +26,28 @@ DEFAULT_CHAT_HISTORY_CLEANUP_INTERVAL_SECONDS = 60
 MAX_CONVERSATION_TITLE_LENGTH = 80
 MAX_ATTACHMENTS_PER_MESSAGE = 5
 LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_message_sources(raw_sources: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_sources, list):
+        return []
+
+    normalized_sources: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for entry in raw_sources:
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("title")
+        url = entry.get("url")
+        if not isinstance(title, str) or not isinstance(url, str):
+            continue
+        normalized_title = title.strip()
+        normalized_url = normalize_source_url(url)
+        if not normalized_title or not normalized_url or normalized_url in seen_urls:
+            continue
+        normalized_sources.append({"title": normalized_title, "url": normalized_url})
+        seen_urls.add(normalized_url)
+    return normalized_sources
 
 
 @dataclass(slots=True)
@@ -507,19 +531,37 @@ class ChatHistoryRepository:
         *,
         content: str,
         state: str,
+        sources: list[dict[str, Any]] | None = None,
     ) -> None:
         current_time = time.time()
         with self._connection() as connection:
             self._maybe_purge_expired_history(connection, current_time)
             self._require_assistant_message(connection, scope_id, conversation_id, assistant_message_id)
-            connection.execute(
-                """
-                UPDATE conversation_messages
-                SET content = ?, state = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                (content, state, current_time, assistant_message_id),
-            )
+            normalized_sources = _normalize_message_sources(sources)
+            if sources is None:
+                connection.execute(
+                    """
+                    UPDATE conversation_messages
+                    SET content = ?, state = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (content, state, current_time, assistant_message_id),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE conversation_messages
+                    SET content = ?, state = ?, sources_json = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        content,
+                        state,
+                        json.dumps(normalized_sources, ensure_ascii=False),
+                        current_time,
+                        assistant_message_id,
+                    ),
+                )
             connection.execute(
                 """
                 UPDATE conversations
@@ -537,6 +579,7 @@ class ChatHistoryRepository:
         *,
         content: str,
         state: str,
+        sources: list[dict[str, Any]] | None = None,
     ) -> None:
         if not content:
             self.delete_message(scope_id, conversation_id, assistant_message_id)
@@ -548,6 +591,7 @@ class ChatHistoryRepository:
             assistant_message_id,
             content=content,
             state=state,
+            sources=sources,
         )
 
     def delete_message(self, scope_id: str, conversation_id: str, message_id: str) -> None:
@@ -635,6 +679,7 @@ class ChatHistoryRepository:
                     conversation_id TEXT NOT NULL,
                     role TEXT NOT NULL,
                     content TEXT NOT NULL,
+                    sources_json TEXT,
                     ordinal INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     created_at REAL NOT NULL,
@@ -692,6 +737,20 @@ class ChatHistoryRepository:
                 """
                 CREATE INDEX IF NOT EXISTS idx_conversation_attachments_scope_status
                 ON conversation_attachments (scope_id, status, created_at)
+                """
+            )
+            self._ensure_conversation_messages_schema(connection)
+
+    def _ensure_conversation_messages_schema(self, connection: sqlite3.Connection) -> None:
+        columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(conversation_messages)").fetchall()
+        }
+        if "sources_json" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE conversation_messages
+                ADD COLUMN sources_json TEXT
                 """
             )
 
@@ -790,7 +849,7 @@ class ChatHistoryRepository:
         placeholders = ", ".join("?" for _ in conversation_ids)
         rows = connection.execute(
             f"""
-            SELECT id, conversation_id, role, content, state, created_at, updated_at
+                        SELECT id, conversation_id, role, content, sources_json, state, created_at, updated_at
             FROM conversation_messages
             WHERE conversation_id IN ({placeholders})
               AND (
@@ -977,15 +1036,27 @@ class ChatHistoryRepository:
         row: sqlite3.Row,
         attachments: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
+        sources = self._deserialize_message_sources(row["sources_json"])
         return {
             "id": str(row["id"]),
             "role": str(row["role"]),
             "content": str(row["content"]),
             "attachments": list(attachments or []),
+            "sources": sources,
             "status": str(row["state"]),
             "createdAt": float(row["created_at"]),
             "updatedAt": float(row["updated_at"]),
         }
+
+    def _deserialize_message_sources(self, value: Any) -> list[dict[str, str]]:
+        if not isinstance(value, str) or not value.strip():
+            return []
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            LOGGER.warning("Failed to parse stored message sources JSON", exc_info=True)
+            return []
+        return _normalize_message_sources(parsed)
 
     def _attachment_row_to_payload(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -1227,6 +1298,7 @@ class ConversationService:
         stream: AsyncIterator[bytes],
     ) -> AsyncIterator[bytes]:
         assistant_content = ""
+        assistant_sources: list[dict[str, str]] = []
         saw_stream_error = False
         stream_error_message = ""
 
@@ -1238,6 +1310,10 @@ class ConversationService:
                     continue
 
                 if isinstance(payload, dict):
+                    stream_sources = self._extract_stream_sources(payload)
+                    if stream_sources:
+                        assistant_sources = stream_sources
+
                     chunk_text = self._extract_stream_text(payload)
                     if chunk_text:
                         assistant_content += chunk_text
@@ -1247,6 +1323,7 @@ class ConversationService:
                             assistant_message_id,
                             content=assistant_content,
                             state="streaming",
+                            sources=assistant_sources or None,
                         )
                     elif self._is_stream_error_payload(payload):
                         saw_stream_error = True
@@ -1273,6 +1350,7 @@ class ConversationService:
                 assistant_message_id,
                 content=final_content,
                 state=final_state,
+                sources=assistant_sources or None,
             )
 
     def _extract_sse_payload(self, chunk: bytes) -> dict[str, Any] | str | None:
@@ -1338,11 +1416,12 @@ class ConversationService:
         if isinstance(reasoning_content, str) and reasoning_content:
             return reasoning_content
 
-        tool_calls = delta.get("tool_calls")
-        if tool_calls:
-            return json.dumps(tool_calls, ensure_ascii=False)
-
         return ""
+
+    def _extract_stream_sources(self, payload: dict[str, Any]) -> list[dict[str, str]]:
+        if payload.get("type") != "assistant_sources":
+            return []
+        return _normalize_message_sources(payload.get("sources"))
 
     def _coerce_stream_content(self, content: Any) -> str:
         if isinstance(content, str):

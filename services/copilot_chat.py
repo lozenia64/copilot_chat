@@ -18,10 +18,39 @@ from .copilot_headers import build_copilot_headers
 from .web_search import (
     WEB_SEARCH_TOOL_NAME,
     WebSearchClient,
+    extract_result_sources,
     format_tool_result_content,
+    normalize_source_url,
 )
 
 LOGGER = logging.getLogger(__name__)
+ASSISTANT_SOURCES_EVENT_TYPE = "assistant_sources"
+ASSISTANT_STATUS_EVENT_TYPE = "assistant_status"
+WEB_SEARCHING_ASSISTANT_STATUS = "web_searching"
+
+
+def _normalize_assistant_sources(raw_sources: Any) -> list[dict[str, str]]:
+    if not isinstance(raw_sources, list):
+        return []
+
+    normalized_sources: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for entry in raw_sources:
+        if not isinstance(entry, dict):
+            continue
+        title = entry.get("title")
+        url = entry.get("url")
+        if not isinstance(title, str) or not isinstance(url, str):
+            continue
+        normalized_title = title.strip()
+        normalized_url = normalize_source_url(url)
+        if not normalized_title or not normalized_url or normalized_url in seen_urls:
+            continue
+        normalized_sources.append({"title": normalized_title, "url": normalized_url})
+        seen_urls.add(normalized_url)
+    return normalized_sources
+
+
 class CopilotChatRequestError(Exception):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -221,6 +250,7 @@ class CopilotChatService:
         extra_headers = self._build_extra_headers(initiator_messages or messages)
         provider_model = self.resolve_litellm_model(model)
         working_messages: list[dict[str, Any]] = list(messages)
+        assistant_sources: list[dict[str, str]] = []
 
         try:
             for _iteration in range(self.MAX_TOOL_CALL_ITERATIONS):
@@ -289,7 +319,11 @@ class CopilotChatService:
                     status_payload = self._tool_status_payload(tool_call)
                     if status_payload is not None:
                         yield self._format_sse(status_payload)
-                    tool_message = await self._execute_tool_call(tool_call)
+                    tool_message, tool_sources = await self._execute_tool_call(tool_call)
+                    merged_sources = self._merge_assistant_sources(assistant_sources, tool_sources)
+                    if merged_sources and merged_sources != assistant_sources:
+                        assistant_sources = merged_sources
+                        yield self._format_sse(self._assistant_sources_payload(assistant_sources))
                     working_messages.append(tool_message)
 
             LOGGER.warning(
@@ -368,25 +402,31 @@ class CopilotChatService:
             })
         return finalized
 
-    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+    async def _execute_tool_call(self, tool_call: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, str]]]:
         function_part = tool_call.get("function") or {}
         name = function_part.get("name") or ""
         arguments_raw = function_part.get("arguments") or ""
         call_id = tool_call.get("id") or ""
 
         if name != WEB_SEARCH_TOOL_NAME:
-            return self._tool_result_message(
-                call_id,
-                name,
-                {"error": f"Unsupported tool: {name}"},
+            return (
+                self._tool_result_message(
+                    call_id,
+                    name,
+                    {"error": f"Unsupported tool: {name}"},
+                ),
+                [],
             )
 
         query = self._extract_search_query(arguments_raw)
         if not query:
-            return self._tool_result_message(
-                call_id,
-                name,
-                {"error": "Missing or invalid 'query' argument."},
+            return (
+                self._tool_result_message(
+                    call_id,
+                    name,
+                    {"error": "Missing or invalid 'query' argument."},
+                ),
+                [],
             )
 
         try:
@@ -398,18 +438,24 @@ class CopilotChatService:
                 type(exc).__name__,
                 exc_info=exc,
             )
-            return self._tool_result_message(
-                call_id,
-                name,
-                {"query": query, "error": "Web search provider unavailable."},
+            return (
+                self._tool_result_message(
+                    call_id,
+                    name,
+                    {"query": query, "error": "Web search provider unavailable."},
+                ),
+                [],
             )
 
-        return {
-            "role": "tool",
-            "tool_call_id": call_id,
-            "name": name,
-            "content": format_tool_result_content(query, results),
-        }
+        return (
+            {
+                "role": "tool",
+                "tool_call_id": call_id,
+                "name": name,
+                "content": format_tool_result_content(query, results),
+            },
+            extract_result_sources(results),
+        )
 
     def _tool_result_message(
         self,
@@ -423,6 +469,32 @@ class CopilotChatService:
             "name": name,
             "content": json.dumps(payload, ensure_ascii=False),
         }
+
+    def _assistant_sources_payload(self, sources: list[dict[str, str]]) -> dict[str, Any]:
+        return {
+            "type": ASSISTANT_SOURCES_EVENT_TYPE,
+            "sources": _normalize_assistant_sources(sources),
+        }
+
+    def _assistant_status_payload(self, status: str) -> dict[str, Any]:
+        return {
+            "type": ASSISTANT_STATUS_EVENT_TYPE,
+            "status": status,
+        }
+
+    def _merge_assistant_sources(
+        self,
+        current_sources: list[dict[str, str]],
+        next_sources: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        merged_sources = list(_normalize_assistant_sources(current_sources))
+        seen_urls = {source["url"] for source in merged_sources}
+        for source in _normalize_assistant_sources(next_sources):
+            if source["url"] in seen_urls:
+                continue
+            merged_sources.append(source)
+            seen_urls.add(source["url"])
+        return merged_sources
 
     def _extract_search_query(self, arguments_raw: str) -> str:
         if not arguments_raw:
@@ -447,11 +519,7 @@ class CopilotChatService:
         query = self._extract_search_query(function_part.get("arguments") or "")
         if not query:
             return None
-        return {
-            "choices": [
-                {"delta": {"content": f"\n_🔎 웹 검색 중: {query}_\n\n"}}
-            ]
-        }
+        return self._assistant_status_payload(WEB_SEARCHING_ASSISTANT_STATUS)
 
     def _extract_visible_text_payload(self, payload: dict[str, Any]) -> dict[str, Any] | None:
         """LiteLLM 청크에서 사용자에게 노출할 텍스트 부분만 추출.

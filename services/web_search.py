@@ -20,11 +20,28 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from typing import Any
+from urllib.parse import urlsplit
 
 
 LOGGER = logging.getLogger(__name__)
 
 WEB_SEARCH_TOOL_NAME = "web_search"
+ALLOWED_SOURCE_URL_SCHEMES = {"http", "https"}
+
+
+def normalize_source_url(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+
+    normalized_value = value.strip()
+    if not normalized_value:
+        return ""
+
+    parsed = urlsplit(normalized_value)
+    if parsed.scheme.lower() not in ALLOWED_SOURCE_URL_SCHEMES or not parsed.netloc:
+        return ""
+
+    return normalized_value
 
 
 @dataclass(frozen=True)
@@ -68,7 +85,7 @@ class WebSearchClient:
             return []
 
         if self._client is None:
-            LOGGER.warning("Tavily client is unavailable; skipping web search for query: %r", query)
+            LOGGER.warning("Tavily client is unavailable; skipping web search.")
             return []
 
         try:
@@ -79,9 +96,8 @@ class WebSearchClient:
             )
         except Exception as exc:
             LOGGER.warning(
-                "Tavily search failed (%s: %s); returning empty results.",
+                "Tavily search failed (%s); returning empty results.",
                 type(exc).__name__,
-                exc,
             )
             return []
 
@@ -96,15 +112,28 @@ class WebSearchClient:
             if not isinstance(item, dict):
                 continue
             title = (item.get("title") or "").strip()
-            url = (item.get("url") or "").strip()
+            url = normalize_source_url(item.get("url"))
             snippet = (item.get("content") or "").strip()
             if not title or not url or url in seen_urls:
                 continue
             results.append(WebSearchResult(title=title, url=url, snippet=snippet))
             seen_urls.add(url)
 
-        LOGGER.info("Tavily search returned %d result(s) for query: %r", len(results), query)
+        LOGGER.info("Tavily search returned %d result(s).", len(results))
         return results
+
+
+def extract_result_sources(results: list[WebSearchResult]) -> list[dict[str, str]]:
+    sources: list[dict[str, str]] = []
+    seen_urls: set[str] = set()
+    for result in results:
+        title = result.title.strip()
+        url = normalize_source_url(result.url)
+        if not title or not url or url in seen_urls:
+            continue
+        sources.append({"title": title, "url": url})
+        seen_urls.add(url)
+    return sources
 
 
 def format_tool_result_content(query: str, results: list[WebSearchResult]) -> str:
