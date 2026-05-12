@@ -158,7 +158,7 @@ def _build_streaming_response(stream) -> StreamingResponse:
     )
 
 
-def _decorate_attachment_urls(payload: dict[str, Any], session_secret: str) -> dict[str, Any]:
+def _decorate_attachment_urls(payload: dict[str, Any], session_secret: str, scope_id: str) -> dict[str, Any]:
     def decorate_session(session: dict[str, Any]) -> None:
         conversation_id = session.get("id")
         messages = session.get("messages")
@@ -178,6 +178,7 @@ def _decorate_attachment_urls(payload: dict[str, Any], session_secret: str) -> d
                     continue
                 attachment["contentUrl"] = image_attachment_service.build_attachment_content_url(
                     session_secret=session_secret,
+                    scope_id=scope_id,
                     conversation_id=conversation_id,
                     attachment_id=attachment_id,
                 )
@@ -279,10 +280,9 @@ async def get_models() -> dict[str, list[dict[str, str]]]:
 async def get_conversations(request: Request, response: Response) -> dict[str, Any]:
     browser_session = _resolve_browser_session_context(request)
     _apply_browser_session_cookie(response, browser_session)
-    payload = conversation_service.get_state_payload(
-        auth_service.get_anonymous_history_scope(browser_session.conversation_scope_id)
-    )
-    return _decorate_attachment_urls(payload, browser_session.session_secret)
+    scope_id = auth_service.get_anonymous_history_scope(browser_session.conversation_scope_id)
+    payload = conversation_service.get_state_payload(scope_id)
+    return _decorate_attachment_urls(payload, browser_session.session_secret, scope_id)
 
 
 @app.post("/api/conversations/state")
@@ -302,6 +302,7 @@ async def get_conversations_state(
     return _decorate_attachment_urls(
         conversation_service.get_state_payload(owner_context.scope_id),
         browser_session.session_secret,
+        owner_context.scope_id,
     )
 
 
@@ -322,7 +323,7 @@ async def create_conversation(
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
     return {
-        "session": _decorate_attachment_urls(session, browser_session.session_secret),
+        "session": _decorate_attachment_urls(session, browser_session.session_secret, owner_context.scope_id),
         "activeSessionId": session["id"],
     }
 
@@ -367,7 +368,7 @@ async def update_conversation_model(
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return {"session": _decorate_attachment_urls(session, browser_session.session_secret)}
+    return {"session": _decorate_attachment_urls(session, browser_session.session_secret, owner_context.scope_id)}
 
 
 @app.post("/api/conversations/{conversation_id}/delete")
@@ -389,7 +390,7 @@ async def delete_conversation(
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return _decorate_attachment_urls(state_payload, browser_session.session_secret)
+    return _decorate_attachment_urls(state_payload, browser_session.session_secret, owner_context.scope_id)
 
 
 @app.post("/api/conversations/{conversation_id}/title")
@@ -413,7 +414,7 @@ async def update_conversation_title(
     )
     _apply_browser_session_cookie(response, browser_session)
     _apply_credential_envelope_header(response, refreshed_envelope)
-    return {"session": _decorate_attachment_urls(session, browser_session.session_secret)}
+    return {"session": _decorate_attachment_urls(session, browser_session.session_secret, owner_context.scope_id)}
 
 
 @app.post("/api/uploads/images")
@@ -470,6 +471,7 @@ async def upload_image_attachment(
     attachment["conversationId"] = conversationId
     attachment["contentUrl"] = image_attachment_service.build_attachment_content_url(
         session_secret=browser_session.session_secret,
+        scope_id=owner_context.scope_id,
         conversation_id=conversationId,
         attachment_id=attachment["id"],
     )
@@ -528,13 +530,18 @@ async def get_image_attachment_content(
     request: Request,
 ):
     browser_session = _resolve_browser_session_context(request)
-    image_attachment_service.validate_attachment_content_token(
+    token_payload = image_attachment_service.validate_attachment_content_token(
         session_secret=browser_session.session_secret,
         conversation_id=conversation_id,
         attachment_id=attachment_id,
         token=token,
     )
-    attachment = conversation_service.get_attachment_record_for_content(conversation_id, attachment_id)
+    attachment = conversation_service.get_attachment_record_for_content(
+        str(token_payload["scope_id"]),
+        conversation_id,
+        attachment_id,
+    )
+    image_attachment_service.open_attachment_file(attachment["storagePath"])
     response = FileResponse(
         path=attachment["storagePath"],
         media_type=attachment["mimeType"],

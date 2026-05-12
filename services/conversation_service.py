@@ -301,6 +301,14 @@ class ChatHistoryRepository:
                 ),
             )
             row = self._require_attachment(connection, scope_id, conversation_id, attachment_id)
+            connection.execute(
+                """
+                UPDATE conversations
+                SET updated_at = ?
+                WHERE id = ? AND scope_id = ?
+                """,
+                (current_time, conversation_id, scope_id),
+            )
 
         payload = self._attachment_row_to_payload(row)
         payload["createdAt"] = float(row["created_at"])
@@ -319,26 +327,13 @@ class ChatHistoryRepository:
 
     def get_attachment_record_for_content(
         self,
+        scope_id: str,
         conversation_id: str,
         attachment_id: str,
     ) -> dict[str, Any]:
         with self._connection() as connection:
             self._maybe_purge_expired_history(connection, time.time())
-            row = connection.execute(
-                """
-                SELECT id, scope_id, conversation_id, message_id, original_filename, mime_type,
-                       byte_size, width, height, storage_path, status, created_at, updated_at
-                FROM conversation_attachments
-                WHERE id = ? AND conversation_id = ?
-                """,
-                (attachment_id, conversation_id),
-            ).fetchone()
-            if row is None:
-                raise ConversationStateError(
-                    status_code=404,
-                    message="첨부 이미지를 찾을 수 없습니다. 다시 업로드하세요.",
-                    code="attachment_not_found",
-                )
+            row = self._require_attachment(connection, scope_id, conversation_id, attachment_id)
         return self._attachment_row_to_internal_payload(row)
 
     def delete_pending_attachment(
@@ -733,7 +728,6 @@ class ChatHistoryRepository:
             (cutoff,),
         ).fetchall()
         expired_conversation_ids = [str(row["id"]) for row in expired_conversation_rows]
-        blocked_conversation_ids: set[str] = set()
 
         if expired_conversation_ids:
             placeholders = ", ".join("?" for _ in expired_conversation_ids)
@@ -753,7 +747,6 @@ class ChatHistoryRepository:
                 try:
                     Path(storage_path).unlink(missing_ok=True)
                 except OSError:
-                    blocked_conversation_ids.add(conversation_id)
                     LOGGER.warning(
                         "Failed to delete expired attachment file during cleanup: conversation_id=%s storage_path=%s",
                         conversation_id,
@@ -761,19 +754,14 @@ class ChatHistoryRepository:
                         exc_info=True,
                     )
 
-            deletable_conversation_ids = [
-                conversation_id
-                for conversation_id in expired_conversation_ids
-                if conversation_id not in blocked_conversation_ids
-            ]
-            if deletable_conversation_ids:
-                placeholders = ", ".join("?" for _ in deletable_conversation_ids)
+            if expired_conversation_ids:
+                placeholders = ", ".join("?" for _ in expired_conversation_ids)
                 connection.execute(
                     f"""
                     DELETE FROM conversations
                     WHERE id IN ({placeholders})
                     """,
-                    tuple(deletable_conversation_ids),
+                    tuple(expired_conversation_ids),
                 )
 
         connection.execute(
@@ -1147,10 +1135,11 @@ class ConversationService:
 
     def get_attachment_record_for_content(
         self,
+        scope_id: str,
         conversation_id: str,
         attachment_id: str,
     ) -> dict[str, Any]:
-        return self._repository.get_attachment_record_for_content(conversation_id, attachment_id)
+        return self._repository.get_attachment_record_for_content(scope_id, conversation_id, attachment_id)
 
     def delete_pending_attachment(
         self,

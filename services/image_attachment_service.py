@@ -152,11 +152,13 @@ class ImageAttachmentService:
         self,
         *,
         session_secret: str,
+        scope_id: str,
         conversation_id: str,
         attachment_id: str,
     ) -> str:
         token = self.build_attachment_content_token(
             session_secret=session_secret,
+            scope_id=scope_id,
             conversation_id=conversation_id,
             attachment_id=attachment_id,
         )
@@ -167,6 +169,7 @@ class ImageAttachmentService:
         self,
         *,
         session_secret: str,
+        scope_id: str,
         conversation_id: str,
         attachment_id: str,
         expires_at: float | None = None,
@@ -175,6 +178,7 @@ class ImageAttachmentService:
         payload = {
             "attachment_id": attachment_id,
             "conversation_id": conversation_id,
+            "scope_id": scope_id,
             "exp": exp,
         }
         payload_bytes = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
@@ -189,7 +193,7 @@ class ImageAttachmentService:
         conversation_id: str,
         attachment_id: str,
         token: str,
-    ) -> None:
+    ) -> dict[str, Any]:
         if not isinstance(token, str) or "." not in token:
             raise ImageAttachmentError(
                 code="attachment_access_denied",
@@ -220,6 +224,13 @@ class ImageAttachmentService:
                 message="이 이미지에 접근할 수 없습니다.",
                 status_code=403,
             )
+        scope_id = payload.get("scope_id")
+        if not isinstance(scope_id, str) or not scope_id.strip():
+            raise ImageAttachmentError(
+                code="attachment_access_denied",
+                message="이 이미지에 접근할 수 없습니다.",
+                status_code=403,
+            )
         expires_at = int(payload.get("exp") or 0)
         if expires_at < int(time.time()):
             raise ImageAttachmentError(
@@ -227,6 +238,7 @@ class ImageAttachmentService:
                 message="이 이미지에 접근할 수 없습니다.",
                 status_code=403,
             )
+        return payload
 
     def attachment_to_data_url(self, storage_path: str | os.PathLike[str]) -> str:
         image_bytes = self.open_attachment_file(storage_path)

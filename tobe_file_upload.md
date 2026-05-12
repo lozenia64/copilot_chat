@@ -241,7 +241,8 @@
 3. `ready_to_upload`
 4. `uploading`
 5. `uploaded`
-6. `failed`
+6. `deleting`
+7. `failed`
 
 ### 드래그 앤 드롭 동작 규칙
 
@@ -523,7 +524,7 @@ GET /api/conversations/{conversation_id}/attachments/{attachment_id}/content?tok
 
 인증 실패 규칙은 아래처럼 고정한다.
 
-1. `POST /api/uploads/images` 는 `credentialEnvelope` 가 없거나 만료되면 즉시 401 로 거절한다.
+1. `POST /api/uploads/images` 는 `multipart/form-data` 의 `credentialEnvelope` 필드가 누락되면 422 요청 검증 오류로 거절한다. 필드는 존재하지만 비어 있거나 만료되면 401 로 거절한다.
 2. `DELETE /api/uploads/images/{attachment_id}` 도 `credentialEnvelope` 가 없거나 만료되면 즉시 401 로 거절한다.
 3. 이 경우 오류 코드는 기존 채팅 API 와 동일하게 `copilot_login_required` 또는 세션 해석 과정에서 발생하는 기존 auth error code 를 재사용한다.
 4. 익명 세션 상태에서는 업로드 성공이나 첨부 삭제를 허용하지 않는다.
@@ -539,10 +540,10 @@ GET /api/conversations/{conversation_id}/attachments/{attachment_id}/content?tok
 
 토큰 규칙:
 
-1. 토큰에는 `attachment_id`, `conversation_id`, `exp` 를 담는다.
+1. 토큰에는 `attachment_id`, `conversation_id`, `scope_id`, `exp` 를 담는다.
 2. HMAC 서명은 현재 브라우저의 `session_secret` 을 사용한다.
 3. 유효 시간은 10분으로 한다.
-4. 이미지 요청 시 서버는 쿠키의 session_secret 과 token 둘 다 검증한다.
+4. 이미지 요청 시 서버는 쿠키의 `session_secret` 과 token 둘 다 검증하고, token 의 `scope_id` 로 실제 첨부 소유 scope 도 확인한다.
 
 이 구조의 의미는 아래와 같다.
 

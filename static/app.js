@@ -1,7 +1,7 @@
 const DEFAULT_MODEL = window.APP_CONFIG?.defaultModel ?? "gpt-5.4";
 const CREDENTIAL_STORAGE_KEY = window.APP_CONFIG?.credentialStorageKey ?? "copilotCredentialEnvelope";
 const SERVER_ERROR_MESSAGES = Object.freeze({
-    conversation_message_required: "보낼 메시지를 입력하세요.",
+    conversation_message_required: "보낼 메시지 또는 이미지를 추가하세요.",
     conversation_attachments_invalid: "첨부 이미지 형식이 올바르지 않습니다.",
     conversation_attachments_limit_exceeded: "이미지는 한 번에 최대 5개까지 전송할 수 있습니다.",
     conversation_not_found: "대화 세션을 찾을 수 없습니다. 새 대화를 시작하세요.",
@@ -63,7 +63,7 @@ const SECONDARY_IMAGE_MAX_DIMENSION = 1600;
 const INITIAL_JPEG_QUALITY = 0.86;
 const MIN_JPEG_QUALITY = 0.55;
 const JPEG_QUALITY_STEP = 0.08;
-const COMPOSER_ATTACHMENT_BUSY_STATES = new Set(["compressing", "uploading"]);
+const COMPOSER_ATTACHMENT_BUSY_STATES = new Set(["compressing", "uploading", "deleting"]);
 // 매 채팅 요청에 함께 보내는 OpenAI 형식의 web_search function tool 스펙.
 // 사용자가 명시적으로 "검색해줘" 라고 말하지 않더라도, 모델이 최신 정보·실시간
 // 데이터·외부 출처가 필요하다고 판단하면 자동으로 이 도구를 호출한다. 실제 검색
@@ -1164,6 +1164,8 @@ function describeComposerAttachmentStatus(attachment) {
             return `업로드 준비${sizeLabel}`;
         case "uploading":
             return "업로드 중";
+        case "deleting":
+            return "삭제 중";
         case "uploaded":
             return `업로드 완료${sizeLabel}`;
         case "failed":
@@ -1181,6 +1183,7 @@ function renderComposerAttachments() {
 
     const fragment = document.createDocumentFragment();
     state.composerAttachments.forEach((attachment) => {
+        const isActionDisabled = COMPOSER_ATTACHMENT_BUSY_STATES.has(attachment.status);
         const item = document.createElement("div");
         item.className = "composer-attachment-item";
 
@@ -1216,6 +1219,7 @@ function renderComposerAttachments() {
             retryButton.type = "button";
             retryButton.className = "composer-attachment-retry";
             retryButton.textContent = "재시도";
+            retryButton.disabled = isActionDisabled;
             retryButton.addEventListener("click", () => {
                 void retryComposerAttachment(attachment.localId);
             });
@@ -1226,6 +1230,7 @@ function renderComposerAttachments() {
         removeButton.type = "button";
         removeButton.className = "composer-attachment-remove";
         removeButton.textContent = "삭제";
+        removeButton.disabled = isActionDisabled;
         removeButton.addEventListener("click", () => {
             void removeComposerAttachment(attachment.localId);
         });
@@ -1363,7 +1368,13 @@ async function removeComposerAttachment(localId) {
         return;
     }
 
-    if (attachment.status === "uploaded" && attachment.attachmentId) {
+    const previousStatus = attachment.status;
+    const shouldDeleteUploadedAttachment = previousStatus === "uploaded" && Boolean(attachment.attachmentId);
+    attachment.status = "deleting";
+    renderComposerAttachments();
+    updateComposerControls();
+
+    if (shouldDeleteUploadedAttachment) {
         try {
             await requestJson(`/api/uploads/images/${encodeURIComponent(attachment.attachmentId)}`, {
                 method: "DELETE",
@@ -1376,6 +1387,9 @@ async function removeComposerAttachment(localId) {
                 }),
             });
         } catch (error) {
+            attachment.status = previousStatus;
+            renderComposerAttachments();
+            updateComposerControls();
             if (error.code === "copilot_login_required") {
                 handleUnauthorizedCopilot(error.message);
             }

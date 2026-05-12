@@ -1171,6 +1171,14 @@ select {
     background: #f3f4f6;
 }
 
+.composer-attachment-remove:disabled,
+.composer-attachment-retry:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+    border-color: var(--border);
+    background: var(--panel-soft);
+}
+
 .attachment-button {
     flex: 0 0 auto;
     gap: 8px;
