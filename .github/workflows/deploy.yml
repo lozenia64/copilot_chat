@@ -17,6 +17,11 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd /home/ubuntu/copilot_chat
+            BEFORE_SHA=$(git rev-parse HEAD)
             git pull origin main
+            AFTER_SHA=$(git rev-parse HEAD)
+            if ! git diff --quiet "$BEFORE_SHA" "$AFTER_SHA" -- requirements.txt; then
+              pip install -r requirements.txt
+            fi
             sudo systemctl restart copilot-chat
             echo "✅ Deploy complete: $(date)"
