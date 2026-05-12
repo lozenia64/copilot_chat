@@ -151,38 +151,40 @@
                 <button id="authModalCloseButton" class="icon-button" type="button" aria-label="닫기">×</button>
             </div>
 
-            <p id="authModalDescription" class="auth-description"></p>
-            <p id="authStatusMeta" class="auth-meta"></p>
+            <div class="auth-modal-body">
+                <p id="authModalDescription" class="auth-description"></p>
+                <p id="authStatusMeta" class="auth-meta"></p>
 
-            <section id="authCodeSection" class="auth-code-section hidden">
-                <div>
-                    <span class="auth-section-label">GitHub 코드</span>
-                    <div id="authUserCode" class="auth-code">-</div>
-                </div>
-                <a id="authVerificationLink" class="ghost-button auth-link-button" href="#" target="_blank" rel="noreferrer">
-                    GitHub 열기
-                </a>
-            </section>
+                <section id="authCodeSection" class="auth-code-section hidden">
+                    <div>
+                        <span class="auth-section-label">GitHub 코드</span>
+                        <div id="authUserCode" class="auth-code">-</div>
+                    </div>
+                    <a id="authVerificationLink" class="ghost-button auth-link-button" href="#" target="_blank" rel="noreferrer">
+                        GitHub 열기
+                    </a>
+                </section>
 
-            <section id="authConnectedSection" class="auth-connected-section hidden">
-                <div class="auth-detail-row">
-                    <span class="auth-section-label">Credential ID</span>
-                    <strong id="authCredentialId">-</strong>
-                </div>
-                <div class="auth-detail-row">
-                    <span class="auth-section-label">Copilot 토큰 만료</span>
-                    <strong id="authExpiryText">-</strong>
-                </div>
-                <div class="auth-detail-row">
-                    <span class="auth-section-label">Chat messages</span>
-                    <strong id="authChatMessagesRemaining">-</strong>
-                </div>
-                <div class="auth-detail-row">
-                    <span class="auth-section-label">Premium requests</span>
-                    <strong id="authPremiumRequestsRemaining">-</strong>
-                </div>
-                <p id="authUsageDetail" class="auth-usage-detail">Usage snapshot을 불러오는 중입니다.</p>
-            </section>
+                <section id="authConnectedSection" class="auth-connected-section hidden">
+                    <div class="auth-detail-row">
+                        <span class="auth-section-label">Credential ID</span>
+                        <strong id="authCredentialId">-</strong>
+                    </div>
+                    <div class="auth-detail-row">
+                        <span class="auth-section-label">Copilot 토큰 만료</span>
+                        <strong id="authExpiryText">-</strong>
+                    </div>
+                    <div class="auth-detail-row">
+                        <span class="auth-section-label">Chat messages</span>
+                        <strong id="authChatMessagesRemaining">-</strong>
+                    </div>
+                    <div class="auth-detail-row">
+                        <span class="auth-section-label">Premium requests</span>
+                        <strong id="authPremiumRequestsRemaining">-</strong>
+                    </div>
+                    <p id="authUsageDetail" class="auth-usage-detail">Usage snapshot을 불러오는 중입니다.</p>
+                </section>
+            </div>
 
             <div class="auth-modal-actions">
                 <button id="authSecondaryButton" class="ghost-button secondary-button" type="button">취소</button>
