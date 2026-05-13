@@ -55,6 +55,9 @@ const MOBILE_VIEWPORT_MAX_WIDTH = 960;
 const COMPACT_VIEWPORT_MAX_HEIGHT = 720;
 const SIDEBAR_OVERLAY_HIDE_DELAY_MS = 180;
 const SIDEBAR_COLLAPSE_STORAGE_KEY = "localChatSidebarCollapsed";
+const MESSAGE_SCROLL_BOTTOM_THRESHOLD = 28;
+const MESSAGE_HISTORY_VIEWPORT_OFFSET = 20;
+const MESSAGE_HISTORY_TOP_OFFSET = 18;
 const MAX_ATTACHMENTS_PER_MESSAGE = 5;
 const MAX_ORIGINAL_IMAGE_BYTES = 15 * 1024 * 1024;
 const TARGET_COMPRESSED_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -133,6 +136,9 @@ const state = {
         isSidebarCollapsed: window.localStorage.getItem(SIDEBAR_COLLAPSE_STORAGE_KEY) === "true",
         sidebarOverlayTimerId: null,
     },
+    scroll: {
+        mode: "latest",
+    },
     composerStatus: {
         message: COMPOSER_READY_MESSAGE,
         tone: "ready",
@@ -164,7 +170,9 @@ const state = {
 const elements = {
     appShell: document.getElementById("appShell"),
     sessionList: document.getElementById("sessionList"),
+    messagePanelToolbar: document.getElementById("messagePanelToolbar"),
     messages: document.getElementById("messages"),
+    messageHistoryJumpButton: document.getElementById("messageHistoryJumpButton"),
     newChatButton: document.getElementById("newChatButton"),
     composerForm: document.getElementById("composerForm"),
     composerDropzone: document.getElementById("composerDropzone"),
@@ -343,6 +351,7 @@ function applyConversationStatePayload(payload) {
         ? payload.sessions.map(normalizeServerSession)
         : [];
 
+    const previousActiveSessionId = state.activeSessionId;
     state.sessions = sessions;
     const requestedActiveSessionId = typeof payload?.activeSessionId === "string"
         ? payload.activeSessionId
@@ -350,6 +359,10 @@ function applyConversationStatePayload(payload) {
     state.activeSessionId = sessions.some((session) => session.id === requestedActiveSessionId)
         ? requestedActiveSessionId
         : sessions[0]?.id ?? null;
+
+    if (state.activeSessionId !== previousActiveSessionId) {
+        setMessageScrollMode("latest");
+    }
 
     renderSidebar();
     renderMessages();
@@ -392,6 +405,7 @@ async function syncConversationStateSilently() {
 function clearConversationState() {
     state.sessions = [];
     state.activeSessionId = null;
+    setMessageScrollMode("latest");
     renderSidebar();
     renderMessages();
     populateModelOptions();
@@ -541,6 +555,7 @@ async function createSession({ focus = true, silent = false } = {}) {
         state.activeSessionId = typeof payload?.activeSessionId === "string"
             ? payload.activeSessionId
             : session.id;
+        setMessageScrollMode("latest");
         renderSidebar();
         renderMessages();
         populateModelOptions();
@@ -581,6 +596,7 @@ async function selectSession(sessionId) {
     }
 
     state.activeSessionId = sessionId;
+    setMessageScrollMode("latest");
     renderSidebar();
     renderMessages();
     populateModelOptions();
@@ -810,10 +826,13 @@ async function deleteSession(sessionId, sessionTitle) {
 }
 
 function renderMessages() {
+    const preserveScroll = shouldPreserveMessageScroll();
+    const previousScrollTop = preserveScroll ? elements.messages.scrollTop : 0;
     elements.messages.innerHTML = "";
     const session = getActiveSession();
 
     if (!session || session.messages.length === 0) {
+        syncMessageHistoryJumpButton();
         return;
     }
 
@@ -825,7 +844,15 @@ function renderMessages() {
     });
 
     elements.messages.appendChild(stack);
-    scrollMessagesToBottom();
+
+    if (preserveScroll) {
+        const maxScrollTop = Math.max(elements.messages.scrollHeight - elements.messages.clientHeight, 0);
+        elements.messages.scrollTop = Math.min(previousScrollTop, maxScrollTop);
+    } else {
+        scrollMessagesToBottom();
+    }
+
+    handleMessagesScroll();
 }
 
 function renderMessageAttachments(container, attachments) {
@@ -969,10 +996,15 @@ function updateMessageContent(message, options = {}) {
     renderMessageBody(body, message);
     if (useStreamFocus) {
         scrollStreamingMessageIntoView(message.id);
+        handleMessagesScroll();
         return;
     }
 
-    scrollMessagesToBottom();
+    if (shouldAutoScrollMessages()) {
+        scrollMessagesToBottom();
+    }
+
+    handleMessagesScroll();
 }
 
 function applyAssistantFailureMessage(session, assistantMessage, message) {
@@ -1728,6 +1760,13 @@ function updateComposerControls() {
     if (elements.attachmentButton) {
         elements.attachmentButton.disabled = state.isStreaming;
     }
+    syncMessageHistoryJumpButton();
+}
+
+function setStreamingState(isStreaming) {
+    state.isStreaming = Boolean(isStreaming);
+    updateComposerControls();
+    syncComposerStatus();
 }
 
 function clearComposerStatusTimer() {
@@ -1790,6 +1829,8 @@ function syncViewportHeightVar() {
     if (document.activeElement === elements.promptInput) {
         scheduleScrollMessagesToBottom(3);
     }
+
+    handleMessagesScroll();
 }
 
 function getViewportLayout() {
@@ -1881,11 +1922,112 @@ function syncResponsiveLayout() {
     if (!viewport.usesOverlaySidebar) {
         closeSidebar({ immediate: true });
     }
+
+    handleMessagesScroll();
 }
 
 function adjustTextareaHeight() {
     elements.promptInput.style.height = "auto";
     elements.promptInput.style.height = `${Math.min(elements.promptInput.scrollHeight, 220)}px`;
+}
+
+function setMessageScrollMode(mode) {
+    state.scroll.mode = mode === "history" ? "history" : "latest";
+}
+
+function shouldPreserveMessageScroll() {
+    return state.scroll.mode === "history" && !state.isStreaming;
+}
+
+function shouldAutoScrollMessages() {
+    return state.scroll.mode === "latest";
+}
+
+function isMessagesNearBottom() {
+    const remaining = elements.messages.scrollHeight - elements.messages.clientHeight - elements.messages.scrollTop;
+    return remaining <= MESSAGE_SCROLL_BOTTOM_THRESHOLD;
+}
+
+function getPreviousUserMessageJumpTarget() {
+    const userMessages = Array.from(elements.messages.querySelectorAll(".message-user[data-message-id]"));
+    const containerRect = elements.messages.getBoundingClientRect();
+    if (!containerRect.height) {
+        return null;
+    }
+
+    const viewportTop = containerRect.top + MESSAGE_HISTORY_VIEWPORT_OFFSET;
+    const firstVisibleIndex = userMessages.findIndex((messageElement) => {
+        return messageElement.getBoundingClientRect().bottom > viewportTop;
+    });
+
+    if (firstVisibleIndex === -1) {
+        return userMessages.at(-1) ?? null;
+    }
+
+    if (firstVisibleIndex === 0) {
+        return null;
+    }
+
+    return userMessages[firstVisibleIndex - 1];
+}
+
+function syncMessageHistoryJumpButton() {
+    if (!elements.messageHistoryJumpButton || !elements.messagePanelToolbar) {
+        return;
+    }
+
+    const target = getPreviousUserMessageJumpTarget();
+    const hasTarget = Boolean(target);
+
+    elements.messagePanelToolbar.hidden = !hasTarget;
+    if (!hasTarget) {
+        elements.messageHistoryJumpButton.disabled = true;
+        return;
+    }
+
+    elements.messageHistoryJumpButton.disabled = state.isStreaming;
+    const buttonTitle = state.isStreaming
+        ? "응답 생성 중에는 사용할 수 없습니다."
+        : "이전 질문으로 이동";
+    elements.messageHistoryJumpButton.title = buttonTitle;
+    elements.messageHistoryJumpButton.setAttribute("aria-label", buttonTitle);
+}
+
+function jumpToPreviousUserMessage() {
+    if (state.isStreaming) {
+        return;
+    }
+
+    const target = getPreviousUserMessageJumpTarget();
+    if (!target) {
+        syncMessageHistoryJumpButton();
+        return;
+    }
+
+    setMessageScrollMode("history");
+
+    const containerRect = elements.messages.getBoundingClientRect();
+    const targetRect = target.getBoundingClientRect();
+    elements.messages.scrollTop = Math.max(
+        0,
+        elements.messages.scrollTop + (targetRect.top - containerRect.top) - MESSAGE_HISTORY_TOP_OFFSET,
+    );
+
+    window.requestAnimationFrame(handleMessagesScroll);
+}
+
+function handleMessagesScroll() {
+    if (!elements.messages) {
+        return;
+    }
+
+    if (state.isStreaming || isMessagesNearBottom()) {
+        setMessageScrollMode("latest");
+    } else {
+        setMessageScrollMode("history");
+    }
+
+    syncMessageHistoryJumpButton();
 }
 
 function scrollMessagesToBottom() {
@@ -1927,6 +2069,10 @@ function scrollStreamingMessageIntoView(messageId) {
 }
 
 function scheduleScrollMessagesToBottom(frameCount = 2) {
+    if (!shouldAutoScrollMessages()) {
+        return;
+    }
+
     let remainingFrames = Math.max(frameCount, 1);
 
     const scrollOnNextFrame = () => {
@@ -3077,13 +3223,11 @@ async function sendPrompt() {
     session.messages.push(assistantMessage);
     session.updatedAt = Date.now();
 
+    setMessageScrollMode("latest");
+    state.abortController = new AbortController();
+    setStreamingState(true);
     renderSidebar();
     renderMessages();
-
-    state.abortController = new AbortController();
-    state.isStreaming = true;
-    updateComposerControls();
-    syncComposerStatus();
     let shouldRefreshUsage = false;
     let shouldResyncConversation = false;
     let didPersistTurn = false;
@@ -3163,13 +3307,10 @@ async function sendPrompt() {
         }
 
         session.updatedAt = Date.now();
+        state.abortController = null;
+        setStreamingState(false);
         renderSidebar();
         renderMessages();
-
-        state.abortController = null;
-        state.isStreaming = false;
-        updateComposerControls();
-        syncComposerStatus();
         focusInput();
 
         if (shouldResyncConversation) {
@@ -3274,6 +3415,8 @@ function bindEvents() {
     });
 
     elements.composerForm.addEventListener("submit", handleComposerSubmit);
+    elements.messages.addEventListener("scroll", handleMessagesScroll, { passive: true });
+    elements.messageHistoryJumpButton?.addEventListener("click", jumpToPreviousUserMessage);
     elements.authStatusButton.addEventListener("click", async () => {
         if (state.copilot.status === "connected") {
             openAuthModal();
