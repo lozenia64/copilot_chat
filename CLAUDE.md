@@ -84,8 +84,8 @@ usage 실패는 인증 실패로 간주하지 않는다.
 
 - auth, scope 파생, 쿠키 발급 로직을 `_resolve_browser_session_context` 밖으로 옮기지 말 것. binding / rotation / scope 불변식이 이 헬퍼의 일관성에 의존한다.
 - 암호화된 envelope 는 브라우저에 대해 opaque 상태를 유지해야 한다. GitHub access token 과 Copilot API token 원본은 응답 body, 로그, 저장된 행 어디에도 노출되어서는 안 된다.
-- 인증/히스토리 관련 요청 처리 중 `auth_service.resolve_session` 또는 `resolve_history_scope` 에서 토큰 refresh 가 발생하면, refresh 된 envelope 는 `X-Copilot-Credential-Envelope` 응답 헤더로 반환된다. 현재 `POST /api/chat`, `POST /api/copilot/status`, `POST /api/uploads/images`, `DELETE /api/uploads/images/{attachment_id}`, 그리고 envelope 를 해석하는 conversation 엔드포인트들이 이 동작을 유지한다. 새 경로를 추가할 때도 반드시 전파할 것.
+- 인증/히스토리 관련 요청 처리 중 `auth_service.resolve_session` 또는 `resolve_history_scope` 에서 토큰 refresh 가 발생하면, refresh 된 envelope 는 `X-Copilot-Credential-Envelope` 응답 헤더로 반환된다. 현재 `POST /api/chat`, `POST /api/copilot/status`, `POST /api/uploads/images`, `DELETE /api/uploads/images/{attachment_id}`, `POST /api/conversations/state`, `POST /api/conversations`, `POST /api/conversations/{id}/activate`, `POST /api/conversations/{id}/model`, `POST /api/conversations/{id}/delete`, `POST /api/conversations/{id}/title`, `POST /api/conversations/{id}/messages` 가 이 동작을 유지한다. 새 경로를 추가할 때도 반드시 전파할 것.
 - LiteLLM 호출 시 model 인자에는 사용자가 본 `model_id` 가 아니라 `resolve_litellm_model(model_id)` 의 결과 (`provider_model`) 를 전달할 것. 두 값을 혼동하면 allow-list 는 통과해도 upstream 호출이 실패한다.
 - 7일 TTL cleanup 은 read/write 경로 안에서 opportunistic 으로 일어난다. 별도 cron 이나 startup 작업이 없으므로 정리 트리거를 우회하는 새 코드 경로를 추가하지 말 것.
 - 동작 중인 서버 (`python main.py`) 는 `reload=False` 다. 코드 변경이 자동 반영되지 않으므로, 로컬에서 코드를 자주 고칠 때는 `uvicorn main:app --reload` 로 띄우는 것을 권장.
-- `.github/agents/` 의 18개 agent 정의는 내부 다중 에이전트 개발 워크플로 (Chief_Agent 오케스트레이터 + 전문 에이전트들) 를 기술한 문서다. Claude Code 가 자동으로 로드하지 *않는다* — 런타임 설정이 아니라 인간 워크플로용 설계 문서로 다룰 것.
+- `.github/agents/` 의 현재 8개 agent 정의는 내부 다중 에이전트 개발 워크플로 (Orchestrator + Spec_Agent/Planner/Implementer/Reviewer/Security/Tester/Documenter) 를 기술한 문서다. Claude Code 가 자동으로 로드하지 *않는다* — 런타임 설정이 아니라 인간 워크플로용 설계 문서로 다룰 것.
