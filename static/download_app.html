@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <title>PilotChat 다운로드</title>
+    <link rel="icon" href="/static/favicon.ico" sizes="any" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+KR:wght@400;500;600;700&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/static/download_app.css" />
+</head>
+<body>
+    <main class="download-page">
+        <section class="download-hero">
+            <p class="download-eyebrow">Hidden Download</p>
+            <h1>PilotChat 앱 다운로드</h1>
+            <p class="download-lead">
+                앱스토어/플레이스토어 배포가 아닌 직접 설치용 파일입니다.
+                아래에서 Android APK와 iOS 배포 파일을 내려받을 수 있습니다.
+            </p>
+        </section>
+
+        <section class="download-grid" aria-label="앱 다운로드 파일">
+            <article class="download-card" data-artifact-card="apk">
+                <div class="download-card-copy">
+                    <p class="download-card-label">Android</p>
+                    <h2>APK 다운로드</h2>
+                    <p class="download-card-description" data-role="description"></p>
+                </div>
+                <div class="download-card-actions">
+                    <a class="download-button" data-role="download" href="#" hidden>다운로드</a>
+                    <p class="download-meta" data-role="meta"></p>
+                </div>
+            </article>
+
+        <section class="download-install-card">
+            <div>
+                <p class="download-card-label">Quick Install</p>
+                <h2>iPhone/iPad 설치 열기</h2>
+                <p class="download-card-description">
+                    iOS 직접 설치를 사용할 때는 Safari에서 manifest 링크를 여는 방식이 일반적입니다.
+                    plist 파일이 서버에 있을 때만 활성화됩니다.
+                </p>
+            </div>
+            <div class="download-card-actions">
+                <a id="iosInstallButton" class="download-button" href="#" hidden>iOS 설치 시작</a>
+                <p id="iosInstallMeta" class="download-meta"></p>
+            </div>
+        </section>
+
+        <section class="download-notes">
+            <h2>설치 메모</h2>
+            <ul>
+                <li>Android는 APK를 내려받아 직접 설치할 수 있습니다.</li>
+                <li>iOS 직접 배포는 기기 정책과 서명 방식에 따라 설치 가능 여부가 달라질 수 있습니다.</li>
+                <li>이 페이지는 외부 링크 없이 직접 주소를 알고 있을 때만 접근할 수 있도록 숨김 경로로 제공됩니다.</li>
+            </ul>
+        </section>
+    </main>
+
+    <script>
+        window.DOWNLOAD_APP_CONFIG = __DOWNLOAD_APP_CONFIG__;
+    </script>
+    <script src="/static/download_app.js" defer></script>
+</body>
+</html>

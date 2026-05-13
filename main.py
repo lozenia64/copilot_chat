@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import json
 import logging
 import os
 import secrets
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, Request, Response, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -24,6 +26,10 @@ BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 CONFIG_PATH = BASE_DIR / "litellm_config.yaml"
 INDEX_PATH = STATIC_DIR / "index.html"
+DOWNLOAD_APP_PAGE_PATH = STATIC_DIR / "download_app.html"
+DOWNLOAD_APP_CSS_PATH = STATIC_DIR / "download_app.css"
+DOWNLOAD_APP_JS_PATH = STATIC_DIR / "download_app.js"
+DOWNLOAD_APP_DIR = BASE_DIR / "downloads" / "app"
 
 load_dotenv(BASE_DIR / ".env")
 
@@ -46,6 +52,40 @@ class BrowserSessionContext:
     created_session_cookie: bool
 
 
+@dataclass(slots=True)
+class DownloadArtifactSpec:
+    slug: str
+    label: str
+    description: str
+    default_filename: str
+    media_type: str
+
+
+DOWNLOAD_ARTIFACT_SPECS: dict[str, DownloadArtifactSpec] = {
+    "apk": DownloadArtifactSpec(
+        slug="apk",
+        label="Android APK",
+        description="Android 기기에서 직접 설치할 수 있는 앱 파일입니다.",
+        default_filename="pilotchat.apk",
+        media_type="application/vnd.android.package-archive",
+    ),
+    "plist": DownloadArtifactSpec(
+        slug="plist",
+        label="iOS Manifest (plist)",
+        description="직접 배포용 iOS manifest 파일입니다.",
+        default_filename="pilotchat.plist",
+        media_type="application/xml",
+    ),
+    "ipa": DownloadArtifactSpec(
+        slug="ipa",
+        label="iOS App (ipa)",
+        description="직접 배포용 iPhone/iPad 앱 패키지입니다.",
+        default_filename="pilotchat.ipa",
+        media_type="application/octet-stream",
+    ),
+}
+
+
 def _build_index_html() -> str:
     style_version = int((STATIC_DIR / "style.css").stat().st_mtime)
     app_version = int((STATIC_DIR / "app.js").stat().st_mtime)
@@ -61,6 +101,66 @@ def _build_index_html() -> str:
         1,
     )
     return index_html
+
+
+def _resolve_download_artifact_path(spec: DownloadArtifactSpec) -> Path:
+    configured_path = os.getenv(f"DOWNLOAD_APP_{spec.slug.upper()}_PATH")
+    if configured_path:
+        return Path(configured_path).expanduser()
+    return DOWNLOAD_APP_DIR / spec.default_filename
+
+
+def _build_download_app_page_config(request: Request) -> dict[str, Any]:
+    artifacts: dict[str, dict[str, Any]] = {}
+
+    for slug, spec in DOWNLOAD_ARTIFACT_SPECS.items():
+        artifact_path = _resolve_download_artifact_path(spec)
+        available = artifact_path.exists() and artifact_path.is_file()
+        artifacts[slug] = {
+            "label": spec.label,
+            "description": spec.description,
+            "available": available,
+            "filename": artifact_path.name if available else spec.default_filename,
+            "downloadUrl": (
+                str(request.url_for("download_app_artifact", artifact=slug))
+                if available
+                else None
+            ),
+        }
+
+    plist_url = artifacts["plist"].get("downloadUrl")
+    ios_install_url = (
+        f"itms-services://?action=download-manifest&url={quote(str(plist_url), safe=':/?=&')}"
+        if isinstance(plist_url, str) and plist_url
+        else None
+    )
+
+    return {
+        "artifacts": artifacts,
+        "iosInstallUrl": ios_install_url,
+    }
+
+
+def _build_download_app_html(page_config: dict[str, Any]) -> str:
+    css_version = int(DOWNLOAD_APP_CSS_PATH.stat().st_mtime)
+    js_version = int(DOWNLOAD_APP_JS_PATH.stat().st_mtime)
+    html = DOWNLOAD_APP_PAGE_PATH.read_text(encoding="utf-8")
+    html = html.replace(
+        "/static/download_app.css",
+        f"/static/download_app.css?v={css_version}",
+        1,
+    )
+    html = html.replace(
+        "/static/download_app.js",
+        f"/static/download_app.js?v={js_version}",
+        1,
+    )
+    html = html.replace(
+        "__DOWNLOAD_APP_CONFIG__",
+        json.dumps(page_config, ensure_ascii=False),
+        1,
+    )
+    return html
 
 
 class CopilotEnvelopeRequest(BaseModel):
@@ -268,6 +368,34 @@ async def index() -> HTMLResponse:
             "Cache-Control": "no-store, max-age=0",
             "Pragma": "no-cache",
         },
+    )
+
+
+@app.get("/download/app")
+async def download_app_page(request: Request) -> HTMLResponse:
+    return HTMLResponse(
+        content=_build_download_app_html(_build_download_app_page_config(request)),
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "Pragma": "no-cache",
+        },
+    )
+
+
+@app.get("/download/app/{artifact}", name="download_app_artifact")
+async def download_app_artifact(artifact: str) -> FileResponse:
+    spec = DOWNLOAD_ARTIFACT_SPECS.get(artifact)
+    if spec is None:
+        raise HTTPException(status_code=404, detail="다운로드 파일을 찾을 수 없습니다.")
+
+    artifact_path = _resolve_download_artifact_path(spec)
+    if not artifact_path.exists() or not artifact_path.is_file():
+        raise HTTPException(status_code=404, detail="다운로드 파일을 찾을 수 없습니다.")
+
+    return FileResponse(
+        path=artifact_path,
+        media_type=spec.media_type,
+        filename=artifact_path.name,
     )
 
 
