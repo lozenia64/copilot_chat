@@ -25,3 +25,6 @@ scratch.py
 
 test_scripts/
 .uploads/
+
+tmp/
+node_modules/
