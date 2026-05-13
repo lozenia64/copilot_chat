@@ -34,5 +34,4 @@ node_modules/
 android/
 *.jks
 *.keystore
-*.apk
 *.aab
