@@ -1,13 +1,9 @@
 .env
 !.env.example
-local.properties
-keystore.properties
 
 .venv/
 __pycache__/
 *.py[cod]
-.gradle/
-build/
 
 .pytest_cache/
 .coverage
@@ -32,8 +28,3 @@ test_scripts/
 
 tmp/
 node_modules/
-android/
-*.jks
-*.keystore
-*.apk
-*.aab
