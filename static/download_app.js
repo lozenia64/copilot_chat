@@ -1,6 +1,23 @@
 (function () {
     const config = window.DOWNLOAD_APP_CONFIG || {};
     const artifacts = config.artifacts || {};
+    const root = document.documentElement;
+    let viewportHeightFrame = null;
+
+    function syncViewportHeight() {
+        if (viewportHeightFrame !== null) {
+            cancelAnimationFrame(viewportHeightFrame);
+        }
+
+        viewportHeightFrame = requestAnimationFrame(() => {
+            const viewportHeight = window.visualViewport
+                ? window.visualViewport.height
+                : window.innerHeight;
+
+            root.style.setProperty("--download-app-height", `${Math.round(viewportHeight)}px`);
+            viewportHeightFrame = null;
+        });
+    }
 
     function applyArtifactCard(slug) {
         const card = document.querySelector(`[data-artifact-card="${slug}"]`);
@@ -32,12 +49,13 @@
         if (disabledEl) {
             disabledEl.hidden = available;
         }
+    }
 
-        if (metaEl) {
-            metaEl.textContent = available
-                ? `현재 파일: ${artifact.filename || ""}`
-                : "서버에 파일이 배치되면 다운로드가 활성화됩니다.";
-        }
+    syncViewportHeight();
+    window.addEventListener("resize", syncViewportHeight);
+    window.addEventListener("orientationchange", syncViewportHeight);
+    if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", syncViewportHeight);
     }
 
     ["apk"].forEach(applyArtifactCard);
@@ -64,12 +82,6 @@
 
     if (iosInstallDisabled) {
         iosInstallDisabled.hidden = hasIosInstall;
-    }
-
-    if (iosInstallMeta) {
-        iosInstallMeta.textContent = hasIosInstall
-            ? `현재 파일: ${plistArtifact.filename || "pilotchat.plist"}, ${ipaArtifact.filename || "pilotchat.ipa"}`
-            : "manifest와 ipa 파일이 준비되면 설치 링크가 활성화됩니다.";
     }
 
     if (iosPlistLink) {

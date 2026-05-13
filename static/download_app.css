@@ -13,6 +13,7 @@
     --radius-md: 18px;
     --font-display: "Space Grotesk", "IBM Plex Sans KR", "Segoe UI", sans-serif;
     --font-body: "IBM Plex Sans KR", "Segoe UI", sans-serif;
+    --download-app-height: 100dvh;
 }
 
 * {
@@ -40,6 +41,10 @@ a {
     width: min(1040px, calc(100vw - 32px));
     margin: 0 auto;
     padding: 40px 0 56px;
+}
+
+.download-page > * {
+    min-height: 0;
 }
 
 .download-hero,
@@ -181,23 +186,127 @@ a {
 }
 
 @media (max-width: 640px) {
+    html,
+    body {
+        height: var(--download-app-height);
+        overflow: hidden;
+    }
+
     .download-page {
-        width: min(100vw - 24px, 1040px);
-        padding: 20px 0 36px;
+        --safe-top: env(safe-area-inset-top, 0px);
+        --safe-bottom: env(safe-area-inset-bottom, 0px);
+        --usable-height: calc(var(--download-app-height) - var(--safe-top) - var(--safe-bottom));
+        --section-gap: clamp(6px, calc(var(--usable-height) * 0.008), 10px);
+        --panel-padding-y: clamp(12px, calc(var(--usable-height) * 0.017), 18px);
+        --panel-padding-x: clamp(16px, calc(var(--usable-height) * 0.02), 20px);
+        width: min(100vw - 16px, 520px);
+        height: var(--download-app-height);
+        padding: var(--safe-top) 0 var(--safe-bottom);
+        display: grid;
+        grid-template-rows:
+            calc(var(--usable-height) * 0.16)
+            calc(var(--usable-height) * 0.20)
+            calc(var(--usable-height) * 0.24)
+            calc(var(--usable-height) * 0.18);
+        gap: var(--section-gap);
+        align-content: start;
     }
 
     .download-hero,
     .download-notes,
     .download-card {
-        border-radius: var(--radius-lg);
+        border-radius: 20px;
+        overflow: hidden;
+    }
+
+    .download-grid {
+        display: contents;
+        margin-top: 0;
+    }
+
+    .download-panel--hero {
+        grid-row: 1;
+    }
+
+    .download-card--android {
+        grid-row: 2;
+    }
+
+    .download-card--ios {
+        grid-row: 3;
+    }
+
+    .download-panel--notes {
+        grid-row: 4;
     }
 
     .download-hero,
-    .download-notes {
-        padding: 24px;
+    .download-notes,
+    .download-card {
+        padding: var(--panel-padding-y) var(--panel-padding-x);
+    }
+
+    .download-eyebrow,
+    .download-card-label {
+        margin-bottom: clamp(4px, calc(var(--usable-height) * 0.007), 8px);
+        font-size: clamp(0.62rem, 2.5vw, 0.72rem);
+        letter-spacing: 0.16em;
+    }
+
+    .download-hero h1 {
+        font-size: clamp(2rem, 8vw, 2.4rem);
+        line-height: 1.02;
+    }
+
+    .download-card h2,
+    .download-notes h2 {
+        font-size: clamp(1.45rem, 6.8vw, 1.95rem);
+        line-height: 1.08;
+    }
+
+    .download-lead {
+        margin-top: clamp(8px, calc(var(--usable-height) * 0.01), 12px);
+        font-size: clamp(0.82rem, 3.5vw, 0.92rem);
+        line-height: 1.45;
     }
 
     .download-card {
-        padding: 20px;
+        gap: clamp(10px, calc(var(--usable-height) * 0.012), 14px);
+    }
+
+    .download-card-description {
+        font-size: clamp(0.8rem, 3.3vw, 0.9rem);
+        line-height: 1.42;
+    }
+
+    .download-card-actions {
+        gap: 8px;
+    }
+
+    .download-button,
+    .download-disabled {
+        min-height: clamp(40px, calc(var(--usable-height) * 0.058), 46px);
+        padding: 10px 14px;
+        border-radius: 16px;
+        font-size: clamp(0.88rem, 3.8vw, 1rem);
+    }
+
+    .download-meta {
+        font-size: clamp(0.72rem, 2.9vw, 0.82rem);
+        line-height: 1.35;
+    }
+
+    .download-notes ul {
+        margin-top: 10px;
+        padding-left: 18px;
+    }
+
+    .download-notes li {
+        font-size: clamp(0.76rem, 3vw, 0.84rem);
+        line-height: 1.38;
+    }
+
+    .download-notes li + li {
+        margin-top: 6px;
     }
 }
