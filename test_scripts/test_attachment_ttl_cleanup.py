@@ -1,3 +1,7 @@
+from _path_setup import ensure_project_root_on_path
+
+ensure_project_root_on_path()
+
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import time
