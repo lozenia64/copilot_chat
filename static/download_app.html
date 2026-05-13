@@ -30,9 +30,35 @@
                 </div>
                 <div class="download-card-actions">
                     <a class="download-button" data-role="download" href="#" hidden>다운로드</a>
+                    <span class="download-disabled" data-role="disabled" hidden>준비 중</span>
                     <p class="download-meta" data-role="meta"></p>
                 </div>
             </article>
+            <article class="download-card" data-artifact-card="plist">
+                <div class="download-card-copy">
+                    <p class="download-card-label">iOS</p>
+                    <h2>Manifest (plist)</h2>
+                    <p class="download-card-description" data-role="description"></p>
+                </div>
+                <div class="download-card-actions">
+                    <a class="download-button" data-role="download" href="#" hidden>다운로드</a>
+                    <span class="download-disabled" data-role="disabled" hidden>준비 중</span>
+                    <p class="download-meta" data-role="meta"></p>
+                </div>
+            </article>
+            <article class="download-card" data-artifact-card="ipa">
+                <div class="download-card-copy">
+                    <p class="download-card-label">iOS</p>
+                    <h2>IPA 다운로드</h2>
+                    <p class="download-card-description" data-role="description"></p>
+                </div>
+                <div class="download-card-actions">
+                    <a class="download-button" data-role="download" href="#" hidden>다운로드</a>
+                    <span class="download-disabled" data-role="disabled" hidden>준비 중</span>
+                    <p class="download-meta" data-role="meta"></p>
+                </div>
+            </article>
+        </section>
 
         <section class="download-install-card">
             <div>
@@ -45,6 +71,7 @@
             </div>
             <div class="download-card-actions">
                 <a id="iosInstallButton" class="download-button" href="#" hidden>iOS 설치 시작</a>
+                <span id="iosInstallDisabled" class="download-disabled" hidden>plist 필요</span>
                 <p id="iosInstallMeta" class="download-meta"></p>
             </div>
         </section>

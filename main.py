@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import plistlib
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
@@ -110,6 +111,13 @@ def _resolve_download_artifact_path(spec: DownloadArtifactSpec) -> Path:
     return DOWNLOAD_APP_DIR / spec.default_filename
 
 
+def _resolve_download_artifact_spec(artifact: str) -> DownloadArtifactSpec | None:
+    for spec in DOWNLOAD_ARTIFACT_SPECS.values():
+        if artifact in {spec.slug, spec.default_filename}:
+            return spec
+    return None
+
+
 def _build_download_app_page_config(request: Request) -> dict[str, Any]:
     artifacts: dict[str, dict[str, Any]] = {}
 
@@ -161,6 +169,31 @@ def _build_download_app_html(page_config: dict[str, Any]) -> str:
         1,
     )
     return html
+
+
+def _build_manifest_response(request: Request, plist_path: Path) -> Response:
+    payload = plistlib.loads(plist_path.read_bytes())
+    items = payload.get("items")
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            assets = item.get("assets")
+            if not isinstance(assets, list):
+                continue
+            for asset in assets:
+                if not isinstance(asset, dict):
+                    continue
+                if asset.get("kind") == "software-package":
+                    asset["url"] = str(request.url_for("download_app_artifact", artifact="ipa"))
+
+    return Response(
+        content=plistlib.dumps(payload),
+        media_type=DOWNLOAD_ARTIFACT_SPECS["plist"].media_type,
+        headers={
+            "Content-Disposition": f'inline; filename="{plist_path.name}"',
+        },
+    )
 
 
 class CopilotEnvelopeRequest(BaseModel):
@@ -383,14 +416,17 @@ async def download_app_page(request: Request) -> HTMLResponse:
 
 
 @app.get("/download/app/{artifact}", name="download_app_artifact")
-async def download_app_artifact(artifact: str) -> FileResponse:
-    spec = DOWNLOAD_ARTIFACT_SPECS.get(artifact)
+async def download_app_artifact(request: Request, artifact: str) -> Response:
+    spec = _resolve_download_artifact_spec(artifact)
     if spec is None:
         raise HTTPException(status_code=404, detail="다운로드 파일을 찾을 수 없습니다.")
 
     artifact_path = _resolve_download_artifact_path(spec)
     if not artifact_path.exists() or not artifact_path.is_file():
         raise HTTPException(status_code=404, detail="다운로드 파일을 찾을 수 없습니다.")
+
+    if spec.slug == "plist":
+        return _build_manifest_response(request, artifact_path)
 
     return FileResponse(
         path=artifact_path,

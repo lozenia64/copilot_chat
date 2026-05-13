@@ -11,19 +11,19 @@
 					<key>kind</key>
 					<string>software-package</string>
 					<key>url</key>
-					<string>https://pilotchat.kr/download/app/pilotchat.ipa</string>
+					<string>https://pilotchat.kr/download/app/ipa</string>
 				</dict>
 				<dict>
 					<key>kind</key>
 					<string>display-image</string>
 					<key>url</key>
-					<string>https://www-drv.com/~chocobi@wustone.com/gd/HIMA/57.png</string>
+					<string>https://pilotchat.kr/static/copilot_color.png</string>
 				</dict>
 				<dict>
 					<key>kind</key>
 					<string>full-size-image</string>
 					<key>url</key>
-					<string>https://www-drv.com/~chocobi@wustone.com/gd/HIMA/512.png</string>
+					<string>https://pilotchat.kr/static/copilot_color.png</string>
 				</dict>
 			</array>
 			<key>metadata</key>
