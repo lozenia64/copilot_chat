@@ -204,10 +204,10 @@ a {
         padding: var(--safe-top) 0 var(--safe-bottom);
         display: grid;
         grid-template-rows:
-            calc(var(--usable-height) * 0.16)
-            calc(var(--usable-height) * 0.20)
-            calc(var(--usable-height) * 0.24)
-            calc(var(--usable-height) * 0.18);
+            calc(var(--usable-height) * 0.22)
+            calc(var(--usable-height) * 0.25)
+            calc(var(--usable-height) * 0.27)
+            calc(var(--usable-height) * 0.22);
         gap: var(--section-gap);
         align-content: start;
     }
