@@ -1410,6 +1410,166 @@ class CopilotApiTests(unittest.TestCase):
             "이 브라우저의 GitHub Copilot 자격 정보가 없습니다. 먼저 로그인하세요.",
         )
 
+    def test_proxy_chat_returns_json_payload_using_hardcoded_server_credentials(self) -> None:
+        streamed_request: dict[str, object] = {}
+
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None, **kwargs):
+            streamed_request["model"] = model
+            streamed_request["messages"] = messages
+            streamed_request["initiator_messages"] = initiator_messages
+            streamed_request["session"] = session
+            yield b'data: {"choices":[{"delta":{"content":"hello "}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"content":"world"}}]}\n\n'
+            yield (
+                'data: {"type":"assistant_sources","sources":[{"title":"Example","url":"https://example.com"}]}\n\n'
+            ).encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        with patch.dict(
+            os.environ,
+            {
+                "COPILOT_CREDENTIAL_ENVELOPE": "hardcoded-envelope",
+                "COPILOT_SESSION_COOKIE_VALUE": "hardcoded-session-cookie",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                self.main.auth_service,
+                "resolve_session",
+                AsyncMock(return_value=(make_credential_session(), "refreshed-envelope")),
+            ) as resolve_session:
+                with patch.object(
+                    self.main.chat_service,
+                    "stream_chat_completion",
+                    fake_stream_chat_completion,
+                ):
+                    response = self.client.post(
+                        "/api/proxy/chat",
+                        json={"MODEL": "gpt-5.4", "PROMPT": "  hello world  "},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers.get("X-Copilot-Credential-Envelope"), "refreshed-envelope")
+        self.assertEqual(
+            response.json(),
+            {
+                "model": "gpt-5.4",
+                "prompt": "hello world",
+                "content": "hello world",
+                "sources": [{"title": "Example", "url": "https://example.com"}],
+                "meta": {"credentialEnvelopeRefreshed": True},
+            },
+        )
+        resolve_session.assert_awaited_once_with(
+            "hardcoded-envelope",
+            "hardcoded-session-cookie",
+        )
+        self.assertEqual(streamed_request["model"], "gpt-5.4")
+        self.assertEqual(
+            streamed_request["messages"],
+            [{"role": "user", "content": "hello world"}],
+        )
+        self.assertEqual(
+            streamed_request["initiator_messages"],
+            [{"role": "user", "content": "hello world"}],
+        )
+
+    def test_proxy_chat_accepts_lowercase_request_keys(self) -> None:
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None, **kwargs):
+            yield b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n'
+            yield b"data: [DONE]\n\n"
+
+        with patch.dict(
+            os.environ,
+            {
+                "COPILOT_CREDENTIAL_ENVELOPE": "hardcoded-envelope",
+                "COPILOT_SESSION_COOKIE_VALUE": "hardcoded-session-cookie",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                self.main.auth_service,
+                "resolve_session",
+                AsyncMock(return_value=(make_credential_session(), None)),
+            ):
+                with patch.object(
+                    self.main.chat_service,
+                    "stream_chat_completion",
+                    fake_stream_chat_completion,
+                ):
+                    response = self.client.post(
+                        "/api/proxy/chat",
+                        json={"model": "gpt-5.4", "prompt": "오늘 날씨는?"},
+                    )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["model"], "gpt-5.4")
+        self.assertEqual(response.json()["prompt"], "오늘 날씨는?")
+        self.assertEqual(response.json()["content"], "ok")
+
+    def test_proxy_chat_returns_json_error_when_stream_emits_error_payload(self) -> None:
+        async def fake_stream_chat_completion(request, model, messages, session, initiator_messages=None, **kwargs):
+            yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
+            yield (
+                'data: {"code":"copilot_chat_stream_failed","message":"채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요."}\n\n'
+            ).encode("utf-8")
+            yield b"data: [DONE]\n\n"
+
+        with patch.dict(
+            os.environ,
+            {
+                "COPILOT_CREDENTIAL_ENVELOPE": "hardcoded-envelope",
+                "COPILOT_SESSION_COOKIE_VALUE": "hardcoded-session-cookie",
+            },
+            clear=False,
+        ):
+            with patch.object(
+                self.main.auth_service,
+                "resolve_session",
+                AsyncMock(return_value=(make_credential_session(), None)),
+            ):
+                with patch.object(
+                    self.main.chat_service,
+                    "stream_chat_completion",
+                    fake_stream_chat_completion,
+                ):
+                    response = self.client.post(
+                        "/api/proxy/chat",
+                        json={"MODEL": "gpt-5.4", "PROMPT": "hello"},
+                    )
+
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(
+            response.json(),
+            {
+                "code": "copilot_chat_stream_failed",
+                "message": "채팅 응답을 생성하지 못했습니다. 잠시 후 다시 시도하세요.",
+            },
+        )
+
+    def test_proxy_chat_requires_server_side_hardcoded_credentials(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "COPILOT_CREDENTIAL_ENVELOPE": "",
+                "COPILOT_SESSION_COOKIE_VALUE": "",
+            },
+            clear=False,
+        ):
+            response = self.client.post(
+                "/api/proxy/chat",
+                json={"MODEL": "gpt-5.4", "PROMPT": "hello"},
+            )
+
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(
+            response.json(),
+            {
+                "code": "proxy_chat_config_missing",
+                "message": "프록시 채팅용 Copilot 자격 정보가 서버에 설정되지 않았습니다. 환경 변수를 확인하세요.",
+            },
+        )
+
     def test_login_poll_with_invalid_handle_returns_safe_error_contract(self) -> None:
         response = self.client.post(
             "/api/copilot/login/poll",

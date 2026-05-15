@@ -7,7 +7,7 @@ import plistlib
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -15,7 +15,7 @@ from fastapi import FastAPI, File, Form, HTTPException, Request, Response, Uploa
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from services.copilot_auth import CopilotAuthError, CopilotAuthService
 from services.copilot_chat import CopilotChatRequestError, CopilotChatService
@@ -213,6 +213,11 @@ class ChatRequest(BaseModel):
     parallel_tool_calls: bool | None = None
 
 
+class ProxyChatRequest(BaseModel):
+    MODEL: str = Field(validation_alias=AliasChoices("MODEL", "model"))
+    PROMPT: str = Field(validation_alias=AliasChoices("PROMPT", "prompt"))
+
+
 class ConversationCreateRequest(BaseModel):
     model: str | None = None
     credentialEnvelope: str | None = None
@@ -289,6 +294,115 @@ def _build_streaming_response(stream) -> StreamingResponse:
             "X-Accel-Buffering": "no",
         },
     )
+
+
+def _extract_text_from_stream_payload(payload: dict[str, Any]) -> str:
+    choice = (payload.get("choices") or [{}])[0]
+    delta = choice.get("delta") or choice.get("message") or {}
+    content = delta.get("content")
+
+    if isinstance(content, str):
+        return content
+
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+
+    return ""
+
+
+def _is_missing_proxy_chat_secret(value: str) -> bool:
+    normalized = value.strip()
+    return not normalized or normalized.startswith("replace-")
+
+
+def _get_proxy_chat_credentials() -> tuple[str, str]:
+    credential_envelope = os.getenv("COPILOT_CREDENTIAL_ENVELOPE", "").strip()
+    session_cookie_value = os.getenv("COPILOT_SESSION_COOKIE_VALUE", "").strip()
+    if _is_missing_proxy_chat_secret(credential_envelope) or _is_missing_proxy_chat_secret(
+        session_cookie_value
+    ):
+        raise CopilotAuthError(
+            status_code=503,
+            message="프록시 채팅용 Copilot 자격 정보가 서버에 설정되지 않았습니다. 환경 변수를 확인하세요.",
+            code="proxy_chat_config_missing",
+        )
+    return credential_envelope, session_cookie_value
+
+
+def _get_proxy_chat_error_status(code: str) -> int:
+    if code == "copilot_rate_limit_exceeded":
+        return 429
+    if code == "copilot_model_not_supported":
+        return 400
+    return 502
+
+
+async def _collect_proxy_chat_payload(stream: AsyncIterator[bytes]) -> dict[str, Any]:
+    content_parts: list[str] = []
+    sources: list[dict[str, str]] = []
+    buffered_text = ""
+
+    async for chunk in stream:
+        decoded_chunk = chunk.decode("utf-8") if isinstance(chunk, bytes) else str(chunk)
+        if not decoded_chunk:
+            continue
+        buffered_text += decoded_chunk
+
+        while "\n\n" in buffered_text:
+            raw_event, buffered_text = buffered_text.split("\n\n", 1)
+            for line in raw_event.splitlines():
+                if not line.startswith("data:"):
+                    continue
+
+                data = line[5:].strip()
+                if not data or data == "[DONE]":
+                    continue
+
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    continue
+
+                if not isinstance(payload, dict):
+                    continue
+
+                if payload.get("type") == "assistant_sources":
+                    raw_sources = payload.get("sources")
+                    if isinstance(raw_sources, list):
+                        sources = [
+                            entry
+                            for entry in raw_sources
+                            if isinstance(entry, dict)
+                            and isinstance(entry.get("title"), str)
+                            and isinstance(entry.get("url"), str)
+                        ]
+                    continue
+
+                code = payload.get("code")
+                message = payload.get("message")
+                if isinstance(code, str) and isinstance(message, str):
+                    raise CopilotAuthError(
+                        status_code=_get_proxy_chat_error_status(code),
+                        message=message,
+                        code=code,
+                    )
+
+                text = _extract_text_from_stream_payload(payload)
+                if text:
+                    content_parts.append(text)
+
+    return {
+        "content": "".join(content_parts),
+        "sources": sources,
+    }
 
 
 def _decorate_attachment_urls(payload: dict[str, Any], session_secret: str, scope_id: str) -> dict[str, Any]:
@@ -852,6 +966,45 @@ async def chat(request: Request, payload: ChatRequest):
     if refreshed_envelope:
         stream_response.headers["X-Copilot-Credential-Envelope"] = refreshed_envelope
     return stream_response
+
+
+@app.post("/api/proxy/chat")
+async def proxy_chat(request: Request, response: Response, payload: ProxyChatRequest) -> dict[str, Any]:
+    prompt = payload.PROMPT.strip()
+    if not prompt:
+        raise CopilotChatRequestError(
+            code="proxy_prompt_required",
+            message="프롬프트를 확인할 수 없습니다. 다시 시도하세요.",
+        )
+
+    credential_envelope, session_cookie_value = _get_proxy_chat_credentials()
+    model, messages = chat_service.validate_chat_request(
+        payload.MODEL,
+        [{"role": "user", "content": prompt}],
+    )
+    copilot_session, refreshed_envelope = await auth_service.resolve_session(
+        credential_envelope,
+        session_cookie_value,
+    )
+    proxy_payload = await _collect_proxy_chat_payload(
+        chat_service.stream_chat_completion(
+            request=request,
+            model=model,
+            messages=messages,
+            session=copilot_session,
+            initiator_messages=messages,
+        )
+    )
+    _apply_credential_envelope_header(response, refreshed_envelope)
+    return {
+        "model": model,
+        "prompt": prompt,
+        "content": proxy_payload["content"],
+        "sources": proxy_payload["sources"],
+        "meta": {
+            "credentialEnvelopeRefreshed": bool(refreshed_envelope),
+        },
+    }
 
 
 if __name__ == "__main__":
